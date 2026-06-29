@@ -5,6 +5,19 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.1] - 2026-06-30
+
+**Upgrade if you installed `0.5.0` from npm.** The `0.5.0` npm artifact was built
+before #29 was merged and shipped without the usage-retry anti-spam fix. `0.5.1`
+includes it. (The git tag `v0.5.0` already contained #29; only the npm tarball was
+behind.)
+
+### Fixed
+- Stop the usage-retry path from spamming an already-resumed session: a lingering
+  limit banner in scrollback no longer re-injects `Continue…` every poll. Detection
+  is now anchored to the live tail, and an `isWorking` gate stops the moment Claude
+  resumes (#29).
+
 ## [0.5.0] - 2026-06-30
 
 This release rolls up everything merged since `0.2.2`, including the API
@@ -18,10 +31,6 @@ overload backoff engine and interactive `/rate-limit-options` menu navigation.
 - Enable mouse scroll and vi copy-mode in tmux sessions created by the tool (#25).
 
 ### Fixed
-- Stop the usage-retry path from spamming an already-resumed session: a lingering
-  limit banner in scrollback no longer re-injects `Continue…` every poll. Detection
-  is now anchored to the live tail, and an `isWorking` gate stops the moment Claude
-  resumes (#29).
 - Require Claude to be in the foreground before driving the
   `/rate-limit-options` menu, preventing keystrokes from leaking into the wrong
   pane (#28).
