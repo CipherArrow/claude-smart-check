@@ -76,6 +76,7 @@ When you disconnect (SSH drops, close terminal, laptop sleeps), **tmux keeps run
 - **Timezone-aware** — parses reset times with full IANA timezone support (including half-hour offsets)
 - **DST-safe** — iterative offset correction handles daylight saving transitions
 - **Safe send-keys** — verifies Claude is still the foreground process before injecting text
+- **Overload backoff** — detects sustained API overload (`429/500/502/503/504/529`) and retries on a configurable exponential backoff with jitter and a cumulative-wait cap, distinct from the usage-reset path ([details](#overload-backoff))
 - **`--print` mode support** — buffers output, retries cleanly for piped/scripted usage
 - **Configurable** — retry count, wait margin, custom patterns, retry message
 - **Config validation** — bad config values fall back to safe defaults instead of crashing
@@ -121,6 +122,105 @@ Optional. Create `~/.claude-auto-retry.json`:
 | `customPatterns` | `[]` | Additional regex patterns to detect rate limits |
 
 All fields optional. Invalid values fall back to defaults automatically.
+
+## Overload backoff
+
+Separate from subscription rate limits, this fork also detects **sustained API
+overload** — Claude Code's own terminal `API Error: <code>` line for the retryable
+set (`429 / 500 / 502 / 503 / 504 / 529`, or an `overloaded_error` JSON body) — and
+retries on an **exponential backoff** instead of waiting for a usage reset. The two
+paths never collide; usage limits always take precedence.
+
+> **Sustained only.** Claude Code already retries transient 5xx/529 internally
+> with its own backoff. This feature fires only when those internal retries are
+> exhausted and a *terminal* error is left in the pane. It should rarely trigger.
+
+> **Terminal vs. transient.** Claude Code renders an in-progress retry as the
+> *parens* form `API Error (529 …) · Retrying in 5s · attempt 3/10`, and the final
+> exhausted error as the *colon* form `API Error: 529 …`. Detection requires the
+> colon form **and** suppresses the `· Retrying…` / `attempt n/m` suffix, so the tool
+> never interrupts Claude's own backoff.
+
+> **Anchored, tail-only matching (why it won't fire on your code).** Patterns are
+> case-insensitive **regexes** matched against only the **last 12 lines** of the
+> pane — never the full scrollback. They are anchored to Claude Code's `API Error:
+> <code>` render, so a bare `503` in code you're editing (`res.status(503)`), a
+> port number, a quoted log, or a `status.claude.com` link in a comment will **not**
+> trip detection. The one residual: a live tail that literally contains
+> `API Error: 529` (e.g. editing this tool, or docs about Claude errors) will match —
+> set `"enabled": false` while doing that. (Earlier versions matched bare status
+> numbers across the whole capture, which injected spurious retries during ordinary
+> web-dev sessions.) For a structured, ambiguity-free trigger see `DESIGN-NOTES.md`.
+
+Configured under an `overload` block (shown with its defaults):
+
+```json
+{
+  "overload": {
+    "enabled": true,
+    "patterns": ["API Error:\\s*(429|500|502|503|504|529)\\b", "overloaded_error", "temporarily limiting requests"],
+    "backoffSeconds": [30, 60, 120, 240, 300],
+    "steadyStateSeconds": 300,
+    "jitterPct": 15,
+    "maxTotalWaitMinutes": 120,
+    "retryMessage": "Continue where you left off.",
+    "relaunchOnExit": false,
+    "relaunchCommand": "claude --continue"
+  }
+}
+```
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `enabled` | `true` | Turn the overload path on/off |
+| `patterns` | (see above) | Case-insensitive **regexes** matching a terminal overload error in the pane tail (last 12 lines) |
+| `backoffSeconds` | `[30,60,120,240,300]` | Wait before each retry; index `i` for attempt `i` |
+| `steadyStateSeconds` | `300` | Wait once the `backoffSeconds` array is exhausted |
+| `jitterPct` | `15` | ±% jitter applied to every wait (clamped 0–100) |
+| `maxTotalWaitMinutes` | `120` | Cumulative-wait cap — give up loudly past this |
+| `retryMessage` | `"Continue where you left off."` | Sent to Claude on each retry |
+| `relaunchOnExit` | `false` | See the gating decision below |
+| `relaunchCommand` | `"claude --continue"` | Command used by `relaunchOnExit` |
+
+The waits go `30 → 60 → 120 → 240 → 300 → 300 …`, each with ±15% jitter, until the
+error clears (success) or the cumulative wait reaches `maxTotalWaitMinutes` (give
+up — the cap guards against hammering a genuinely-down endpoint or masking a real
+outage; check [status.claude.com](https://status.claude.com)).
+
+### Event-driven detection (recommended — no scraping)
+
+The scraper above is a heuristic over terminal output. For an exact, ambiguity-free
+trigger, install the **`StopFailure` hook** — Claude Code fires it precisely when a
+turn ends in an API error, with a typed error class:
+
+```sh
+claude-auto-retry install-hook                  # into $CLAUDE_CONFIG_DIR or ~/.claude
+claude-auto-retry install-hook /path/to/config  # repeat per CLAUDE_CONFIG_DIR you use
+```
+
+This adds a `StopFailure` hook (matcher `overloaded|server_error|rate_limit`) that
+writes a pane-keyed marker the monitor consumes — no terminal scraping, so it cannot
+false-positive on code or scrollback. Sessions launched via the wrapper **after**
+installing the hook use it automatically; the first marker latches event mode and
+disables the scraper for that session. Sessions without the hook (or pre-install) fall
+back to the anchored scraper. Remove with `uninstall-hook`. See `DESIGN-NOTES.md` for
+the architecture.
+
+### Gating decision (alive-at-prompt vs exited-to-shell)
+
+A transient API error in interactive Claude Code surfaces inline and leaves the
+process **alive at its prompt** — it does not exit to the shell. So the default,
+robust behavior reuses the existing usage-limit mechanism: only retry when the
+foreground process is `claude`/`node` and the session is **idle, not working**
+(the `esc to interrupt` footer is absent). Retrying mid-internal-retry would
+double-drive the session, so that case is deferred, never sent.
+
+If a `500` ever *does* drop you to the shell, `send-keys` is correctly blocked by
+the foreground check (it never types into bash), and the tool logs
+`overload-exited-to-shell` rather than masking it. Auto-relaunch is **off by
+default** — blindly typing `claude --continue` into a shell the user may be using
+is worse than surfacing the stall. Set `relaunchOnExit: true` (and adjust
+`relaunchCommand`) only if you actually observe shell-exits on overload.
 
 ## CLI Commands
 
@@ -209,7 +309,7 @@ Contributions are welcome! Here's how to get started:
 ```bash
 git clone https://github.com/cheapestinference/claude-auto-retry.git
 cd claude-auto-retry
-npm test            # Run all 59 tests
+npm test            # Run all 128 tests
 npm link            # Install locally for testing
 ```
 
@@ -219,15 +319,15 @@ npm link            # Install locally for testing
 claude-auto-retry/
 ├── bin/cli.js              # CLI: install/uninstall/status/logs/version
 ├── src/
-│   ├── patterns.js         # Rate limit detection + ANSI stripping
+│   ├── patterns.js         # Rate limit + overload detection + ANSI stripping
 │   ├── time-parser.js      # Reset time parsing with timezone support
 │   ├── config.js           # Config loading + validation
 │   ├── logger.js           # File-based logging with rotation
 │   ├── tmux.js             # tmux command wrappers (execFile-based)
-│   ├── monitor.js          # Core monitoring loop + retry logic
+│   ├── monitor.js          # Core monitoring loop + retry logic (usage + overload paths)
 │   ├── launcher.js         # Process orchestration + signal forwarding
 │   └── wrapper.sh          # Shell function template
-├── test/                   # 59 tests across 7 test files
+├── test/                   # 128 tests across 8 test files
 ├── package.json
 ├── LICENSE
 └── README.md
