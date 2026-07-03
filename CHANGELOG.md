@@ -14,6 +14,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   to the `API Error` render (mentioning the phrases in conversation can't
   trigger it), and the retry budget is kept across working ticks so a sticky
   flag stays bounded (#33).
+- tmux status bar indicator: the monitor now writes a per-pane status snapshot to
+  `~/.claude-auto-retry/status/<pane>.json` on every poll tick, and a new
+  `claude-auto-retry-tmux-status` script renders it as a status-bar segment
+  (`🟢AR` monitoring, `⏳AR 1h30m` waiting on a reset, `🟠AR 45s` overload backoff,
+  `🔴AR` gave up). Dependency-free POSIX shell; hides itself if a pane has no
+  monitor or its status file is stale (staleness is derived from the monitor's
+  actual poll interval, not a fixed constant).
 
 ### Fixed
 - `rate_limit` StopFailure events are no longer routed through the seconds-scale

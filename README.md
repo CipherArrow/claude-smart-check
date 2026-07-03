@@ -78,6 +78,7 @@ When you disconnect (SSH drops, close terminal, laptop sleeps), **tmux keeps run
 - **Safe send-keys** — verifies Claude is still the foreground process before injecting text
 - **Overload backoff** — detects sustained API overload (`429/500/502/503/504/529`) and retries on a configurable exponential backoff with jitter and a cumulative-wait cap, distinct from the usage-reset path ([details](#overload-backoff))
 - **Safeguard retry** — auto-continues past an AUP-safeguard false-positive (often transient), capped at a few tries so a sticky flag can't loop ([details](#safeguard-retry))
+- **tmux status bar indicator** — see at a glance whether a pane is being monitored, waiting on a reset, backing off from overload, or has given up ([details](#tmux-status-bar-indicator))
 - **`--print` mode support** — buffers output, retries cleanly for piped/scripted usage
 - **Configurable** — retry count, wait margin, custom patterns, retry message
 - **Config validation** — bad config values fall back to safe defaults instead of crashing
@@ -309,6 +310,34 @@ Configured under a `safeguard` block (defaults shown):
 
 Usage limits always take precedence; the safeguard path only acts when Claude is idle
 (no `esc to interrupt` footer) and the foreground process is `claude`/`node`.
+## tmux status bar indicator
+
+The monitor writes a small JSON snapshot to `~/.claude-auto-retry/status/<pane>.json`
+on every poll tick, so you can tell at a glance — without checking logs — whether a
+pane is being watched, waiting out a usage-limit reset, or backing off from overload.
+
+Add a segment to `status-right` (or `status-left`) in `~/.tmux.conf` that shells out to
+the bundled reader script, passing the current pane id:
+
+```tmux
+set -g status-interval 5
+set -g status-right "#(claude-auto-retry-tmux-status '#{pane_id}') | %Y-%m-%d %H:%M"
+```
+
+`tmux` substitutes `#{pane_id}` with the *attached client's current pane* before running
+the command, so the segment always reflects whichever pane you're looking at. It prints:
+
+| Pane state | Indicator |
+|------------|-----------|
+| Actively monitoring | `🟢AR` |
+| Waiting on a usage-limit reset | `⏳AR 1h30m` |
+| Backing off from overload | `🟠AR 45s` |
+| No monitor for this pane, or the status file is stale (>30s — the monitor process died without cleaning up) | *(nothing)* |
+
+The script (`bin/tmux-status.sh`) is pure POSIX shell with no dependencies (no `jq`,
+no `node`), so it's cheap to run every few seconds from every attached client.
+`status-interval` defaults to 15s in tmux; dropping it to `5` (matching the monitor's
+default `pollIntervalSeconds`) keeps the overload countdown responsive.
 
 ## CLI Commands
 

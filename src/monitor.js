@@ -4,6 +4,7 @@ import { capturePane, sendKeys, sendKey, getPaneCommand, isProcessForeground } f
 import { loadConfig } from './config.js';
 import { createLogger } from './logger.js';
 import { readStopFailureEvent, clearStopFailureEvent, isRetryableError } from './events.js';
+import { writeStatus, clearStatus } from './status-file.js';
 
 const DEFAULT_FOREGROUND_COMMANDS = ['node', 'claude', 'npx', 'tsx', 'bun', 'deno'];
 const SHELL_COMMANDS = ['bash', 'zsh', 'sh', 'fish', 'dash', 'ksh'];
@@ -429,7 +430,21 @@ export async function startMonitor(pane, pid) {
       const result = await processOneTick(state, tmuxAdapter, pane, config, isAlive);
       consecutiveErrors = 0;
 
-      if (result === 'exit') { await logger.info('Claude exited. Monitor shutting down.'); process.exit(0); }
+      if (result === 'exit') {
+        await clearStatus(pane).catch(() => {});
+        await logger.info('Claude exited. Monitor shutting down.');
+        process.exit(0);
+      }
+
+      // Published for external consumers (e.g. a tmux status-bar segment) — best-effort,
+      // never let a write failure interrupt the monitor loop.
+      await writeStatus(pane, {
+        status: state.status,
+        waitUntil: Math.floor(state.waitUntil / 1000),
+        overloadWaitUntil: Math.floor(state.overloadWaitUntil / 1000),
+        attempts: state.attempts,
+        overloadAttempts: state.overloadAttempts,
+      }).catch(() => {});
       if (result === 'waiting' && state.lastRateLimitMessage) {
         const secs = Math.round((state.waitUntil - Date.now()) / 1000);
         await logger.info(`Rate limit detected: "${state.lastRateLimitMessage}". Waiting ${secs}s...`);
@@ -472,6 +487,7 @@ export async function startMonitor(pane, pid) {
       consecutiveErrors++;
       await logger.error(`Monitor tick error: ${err.message}`).catch(() => {});
       if (consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {
+        await clearStatus(pane).catch(() => {});
         await logger.error(`${MAX_CONSECUTIVE_ERRORS} consecutive errors. Pane likely destroyed. Exiting.`).catch(() => {});
         process.exit(1);
       }
