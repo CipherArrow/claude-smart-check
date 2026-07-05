@@ -24,9 +24,11 @@ move is to stop using the scrape as the *trigger*.
   suffix on the colon form). Acting on the transient form interrupts Claude's *own*
   backoff. **[done]** — we require the colon form and suppress the retry suffix via the
   working gate.
-- **Error → HTTP status → retryability.** Retryable: `429 rate_limit_error`,
-  `500 api_error`, `504 timeout_error`, `529 overloaded_error`, plus edge `502/503`
+- **Error → HTTP status → retryability.** Retryable (seconds-scale): `500 api_error`,
+  `504 timeout_error`, `529 overloaded_error`, plus edge `502/503`
   (no JSON body — plain text/HTML from Cloudflare/envoy, e.g. `503 no healthy upstream`).
+  `429 rate_limit_error` is NOT event-retryable: on a subscription it is the session/usage
+  limit — an hours-scale wait owned by the scraper usage path, not a seconds-scale retry.
   Never retry: `400/401/402/403/404/413`. The official SDK retry set is `408/409/429 +
   all 5xx`. **[done]** — default patterns cover `429|500|502|503|504|529` + `overloaded_error`.
 - **API-429 has no 3-digit code in the slot.** It renders
@@ -43,8 +45,10 @@ move is to stop using the scrape as the *trigger*.
 **Implemented.** The launcher stamps `CLAUDE_AUTO_RETRY_PANE` onto claude's env; the
 `StopFailure` hook (`claude-auto-retry _stopfailure-hook`, installed via
 `install-hook`) runs as a claude child, inherits that var, and writes a pane-keyed
-marker under `~/.claude-auto-retry/events/` for retryable error types
-(`overloaded|server_error|rate_limit`). The monitor reads the marker for its own pane
+marker under `~/.claude-auto-retry/events/` for the transient-overload error types
+(`overloaded|server_error` — `rate_limit` is deliberately excluded: it is the hours-scale
+session/usage limit, owned by the scraper usage path; see src/events.js). The monitor
+reads the marker for its own pane
 each tick; the first marker latches `eventMode`, which disables the scraper for that
 session. Edge-triggered: one backoff-then-send per failure, then back to monitoring;
 self-recovery and foreground/shell gates still apply; the cumulative cap is shared with
@@ -97,7 +101,8 @@ hookInput = { hook_event_name: "StopFailure", error, error_details, last_assista
 ```
 
 plus the standard envelope (`session_id`, `transcript_path`, `cwd`). So a matcher of
-`overloaded|server_error|rate_limit` selects exactly the retryable classes, and the
+`overloaded|server_error` selects exactly the transient-overload classes (`rate_limit`
+is excluded — a session/usage limit is not an overload; see src/events.js), and the
 handler gets the error type for free — no scraping. **The blocker is cleared; this
 direction is ready to build.** It supersedes the scraper for the overload path; the
 scraper stays as a legacy fallback for users who won't install hooks. Remaining

@@ -201,9 +201,11 @@ async function cmdLogs() {
 const HOOK_MARKER = '_stopfailure-hook';
 
 function stopFailureHookEntry() {
-  // Matcher filters on the StopFailure error type; we want the retryable classes only.
+  // Matcher filters on the StopFailure error type; only the transient-overload classes.
+  // rate_limit is intentionally omitted — a session/usage limit is an hours-scale wait
+  // owned by the scraper usage path, not a seconds-scale event retry (see src/events.js).
   return {
-    matcher: 'overloaded|server_error|rate_limit',
+    matcher: 'overloaded|server_error',
     hooks: [{ type: 'command', command: `node ${__filename} ${HOOK_MARKER}`, timeout: 5 }],
   };
 }

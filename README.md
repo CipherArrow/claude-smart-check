@@ -198,13 +198,19 @@ claude-auto-retry install-hook                  # into $CLAUDE_CONFIG_DIR or ~/.
 claude-auto-retry install-hook /path/to/config  # repeat per CLAUDE_CONFIG_DIR you use
 ```
 
-This adds a `StopFailure` hook (matcher `overloaded|server_error|rate_limit`) that
-writes a pane-keyed marker the monitor consumes — no terminal scraping, so it cannot
+This adds a `StopFailure` hook (matcher `overloaded|server_error`) that writes a
+pane-keyed marker the monitor consumes — no terminal scraping, so it cannot
 false-positive on code or scrollback. Sessions launched via the wrapper **after**
 installing the hook use it automatically; the first marker latches event mode and
 disables the scraper for that session. Sessions without the hook (or pre-install) fall
 back to the anchored scraper. Remove with `uninstall-hook`. See `DESIGN-NOTES.md` for
 the architecture.
+
+> **Why not `rate_limit`?** The event path handles only *transient overloads*
+> (seconds-scale backoff). A `rate_limit` is the subscription **session/usage limit** —
+> an hours-scale wait until a printed reset time — so it's handled by the usage-wait
+> path above, not the overload path. Routing it through the hook would fire premature
+> retries against a session that's simply out of quota.
 
 ### Gating decision (alive-at-prompt vs exited-to-shell)
 

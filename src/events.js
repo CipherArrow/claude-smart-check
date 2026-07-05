@@ -1,7 +1,7 @@
 // StopFailure event channel: the authoritative, scrape-free overload trigger.
 //
 // Claude Code's `StopFailure` hook fires only when a turn ends in an API error, with a
-// typed `error` (matcher-filtered to overloaded/server_error/rate_limit). The hook runs
+// typed `error` (matcher-filtered to overloaded/server_error). The hook runs
 // as a CHILD of claude, so it inherits the env the launcher stamped onto claude —
 // including CLAUDE_AUTO_RETRY_PANE. It writes a marker keyed by that pane; the daemon,
 // which already knows its pane, reads it directly. No session-id plumbing needed (the
@@ -16,9 +16,18 @@ import { homedir } from 'node:os';
 
 export const EVENTS_DIR = join(homedir(), '.claude-auto-retry', 'events');
 
-// Error types we treat as a retryable overload — mirrors the hook matcher. Anything else
-// (auth, billing, invalid_request, …) is permanent and must NOT drive a retry.
-const RETRYABLE = new Set(['overloaded', 'server_error', 'rate_limit']);
+// Error types the event path treats as a *transient overload* (seconds-scale backoff).
+// NOTE: `rate_limit` is deliberately EXCLUDED. For a subscription it is the session/usage
+// limit — an HOURS-scale wait until a printed reset time, not a seconds-scale retry.
+// Routing it here made the monitor fire futile "Continue" retries into a session-limited
+// pane and fight the (correct) scraper usage-wait path. Session/usage limits are owned by
+// the scraper usage path (it reliably reads the persistent "…resets <time>" banner and
+// waits); a genuinely transient API 429 is caught by the overload scraper's "temporarily
+// limiting requests" pattern — but only while the scraper is active (it is disabled once
+// eventMode latches), so API-key sessions in event mode currently get no retry for that
+// case. A known, accepted gap: rare, and strictly better than misrouting session limits.
+// Permanent errors (auth/billing/invalid) never retry.
+const RETRYABLE = new Set(['overloaded', 'server_error']);
 
 export function isRetryableError(errorType) {
   return typeof errorType === 'string' && RETRYABLE.has(errorType.toLowerCase());

@@ -8,10 +8,16 @@ import {
 } from '../src/events.js';
 
 describe('isRetryableError', () => {
-  it('accepts the retryable overload classes', () => {
-    for (const e of ['overloaded', 'server_error', 'rate_limit', 'OVERLOADED']) {
+  it('accepts the transient-overload classes', () => {
+    for (const e of ['overloaded', 'server_error', 'OVERLOADED']) {
       assert.equal(isRetryableError(e), true, e);
     }
+  });
+  it('rejects rate_limit (a session/usage limit is an hours-scale wait, not an overload)', () => {
+    // Regression: routing rate_limit through the event/overload path made the monitor
+    // fire futile seconds-scale "Continue" retries into a session-limited pane and fight
+    // the scraper usage-wait path. Session limits are owned by the scraper usage path.
+    assert.equal(isRetryableError('rate_limit'), false);
   });
   it('rejects permanent / unknown classes', () => {
     for (const e of ['authentication_failed', 'billing_error', 'invalid_request', '', undefined, null, 42]) {

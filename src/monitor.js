@@ -3,7 +3,7 @@ import { parseResetTime, calculateWaitMs } from './time-parser.js';
 import { capturePane, sendKeys, sendKey, getPaneCommand, isProcessForeground } from './tmux.js';
 import { loadConfig } from './config.js';
 import { createLogger } from './logger.js';
-import { readStopFailureEvent, clearStopFailureEvent } from './events.js';
+import { readStopFailureEvent, clearStopFailureEvent, isRetryableError } from './events.js';
 
 const DEFAULT_FOREGROUND_COMMANDS = ['node', 'claude', 'npx', 'tsx', 'bun', 'deno'];
 const SHELL_COMMANDS = ['bash', 'zsh', 'sh', 'fish', 'dash', 'ksh'];
@@ -295,6 +295,16 @@ export async function processOneTick(state, tmuxAdapter, pane, config, isAlive, 
   if (overload && overload.enabled && tmuxAdapter.readEvent) {
     const ev = await tmuxAdapter.readEvent();
     if (ev) {
+      // Consume-side guard: trust no writer. The hook entry in settings.json freezes the
+      // cli.js path + matcher at install time, so an OLDER hook binary (whose matcher and
+      // RETRYABLE set still include rate_limit) can keep writing markers after an upgrade.
+      // Consume-and-ignore anything non-retryable, and do NOT latch eventMode off it —
+      // a misclassified marker must not start a backoff nor disable the scraper paths.
+      if (!isRetryableError(ev.error)) {
+        await tmuxAdapter.clearEvent();             // consume so it can't re-fire
+        state._ignoredEventError = ev.error;
+        return 'event-ignored';
+      }
       state.eventMode = true;
       await tmuxAdapter.clearEvent();               // consume
       if (isWorking(stripped)) { resetOverload(state); return 'overload-cleared'; } // self-recovered
@@ -363,6 +373,7 @@ export async function startMonitor(pane, pid) {
       if (result === 'user-continued') await logger.info('User already continued. Attempt counter reset.');
       if (result === 'max-retries') await logger.warn(`Max retries (${config.maxRetries}) reached. Monitor still active but will not send further retries until rate limit clears.`);
       if (result === 'skipped-not-claude') await logger.warn(`Foreground is "${state._lastForeground}", not Claude. Skipping send-keys. (Add to foregroundCommands in ~/.claude-auto-retry.json if this is wrong)`);
+      if (result === 'event-ignored') await logger.warn(`Ignored StopFailure marker with non-retryable error="${state._ignoredEventError}". If this is "rate_limit", an outdated hook is installed — re-run "claude-auto-retry install-hook".`);
       if (result === 'overload-detected') {
         const secs = Math.round((state.overloadWaitUntil - Date.now()) / 1000);
         const m = state._overloadMatch;
