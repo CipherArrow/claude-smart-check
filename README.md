@@ -340,9 +340,10 @@ pane you're looking at, correctly scoped to the tmux server it belongs to. The
 `socket_path` argument matters if you ever run more than one tmux server on the same
 machine (e.g. `tmux -L work`, `tmux -L personal`, or two users' default servers on a
 shared host): pane ids like `%2` are only unique *within* a server, so without it two
-different servers' `%2` panes would render each other's status. It's technically
-optional (older single-argument configs still work, falling back to a shared key), but
-pass it unless you're certain you'll only ever run one tmux server.
+different servers' `%2` panes would render each other's status. Always pass it: the
+monitor keys each status file by the socket path it inherits from `$TMUX`, so a
+single-argument config looks under a shared `default` key the monitor never writes to,
+and the segment simply stays blank.
 
 It prints:
 

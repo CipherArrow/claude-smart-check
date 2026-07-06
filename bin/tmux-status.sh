@@ -7,9 +7,10 @@
 #   #(~/.local/lib/node_modules/claude-auto-retry/bin/tmux-status.sh '#{pane_id}' '#{socket_path}')
 #
 # The 2nd arg (tmux's own #{socket_path} format variable) disambiguates panes across
-# independent tmux servers (`tmux -L work` vs `tmux -L personal` can each have a "%2").
-# It's optional for backward compatibility with an older single-arg tmux.conf snippet,
-# but omitting it re-introduces the cross-server collision — pass it if you can.
+# independent tmux servers (`tmux -L work` vs `tmux -L personal` can each have a "%2")
+# and is effectively required: the monitor keys its status files by the socket path it
+# inherits from $TMUX, so a single-arg invocation looks under a "default" key the monitor
+# never writes to and the segment just stays blank. Always pass '#{socket_path}'.
 #
 # Prints nothing if the pane has no monitor, or the monitor's status file is stale
 # (monitor process died without cleaning up — e.g. `kill -9`, machine sleep during a

@@ -12,7 +12,7 @@
 // Mirrors the pane-keyed write/read/clear shape of events.js (StopFailure markers), and
 // shares its filename sanitizer (see pane-key.js).
 
-import { mkdir, writeFile, readFile, unlink, rename, readdir } from 'node:fs/promises';
+import { mkdir, writeFile, readFile, unlink, rename, readdir, stat } from 'node:fs/promises';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
 import { sanitizeKey } from './pane-key.js';
@@ -96,18 +96,30 @@ export async function sweepStaleStatus(dir = STATUS_DIR, maxAgeSeconds = 300) {
   const now = Math.floor(Date.now() / 1000);
   let removed = 0;
   for (const name of entries) {
-    if (!name.endsWith('.json')) continue;
     const file = join(dir, name);
-    try {
-      const data = JSON.parse(await readFile(file, 'utf-8'));
-      if (typeof data.updatedAt !== 'number' || now - data.updatedAt > maxAgeSeconds) {
-        await unlink(file);
-        removed++;
+    if (name.endsWith('.json')) {
+      try {
+        const data = JSON.parse(await readFile(file, 'utf-8'));
+        if (typeof data.updatedAt !== 'number' || now - data.updatedAt > maxAgeSeconds) {
+          await unlink(file);
+          removed++;
+        }
+      } catch {
+        // Unparseable/corrupt snapshot — it can never become valid on its own; remove it.
+        try { await unlink(file); removed++; } catch { /* already gone */ }
       }
-    } catch {
-      // Unparseable/half-written leftover (e.g. an orphaned .tmp file from a crash
-      // mid-rename) — it can never become valid on its own; remove it too.
-      try { await unlink(file); removed++; } catch { /* already gone */ }
+    } else if (name.endsWith('.tmp')) {
+      // Orphaned atomic-write temp (`<pane>.json.<pid>.tmp`) left when writeStatus died
+      // between writeFile and rename. Its body may be half-written, so age it by mtime
+      // rather than a parsed updatedAt — and only sweep ones older than maxAgeSeconds so a
+      // live writeStatus mid-rename (tmp exists for microseconds) is never yanked out.
+      try {
+        const { mtimeMs } = await stat(file);
+        if (now - Math.floor(mtimeMs / 1000) > maxAgeSeconds) {
+          await unlink(file);
+          removed++;
+        }
+      } catch { /* already gone */ }
     }
   }
   return removed;

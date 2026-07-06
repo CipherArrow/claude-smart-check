@@ -1,6 +1,6 @@
 import { describe, it, before, after, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, rm, readdir, writeFile } from 'node:fs/promises';
+import { mkdtemp, rm, readdir, writeFile, utimes } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { writeStatus, readStatus, clearStatus, sweepStaleStatus } from '../src/status-file.js';
@@ -112,13 +112,45 @@ describe('per-pane status file', () => {
       }
     });
 
-    it('removes unparseable leftovers (e.g. an orphaned .tmp file)', async () => {
+    it('removes an unparseable .json snapshot', async () => {
       const sweepDir = await mkdtemp(join(tmpdir(), 'car-status-sweep-'));
       try {
         await writeFile(join(sweepDir, 'default__orphan.json'), 'not json');
         const removed = await sweepStaleStatus(sweepDir, 300);
         assert.equal(removed, 1);
         assert.deepEqual(await readdir(sweepDir), []);
+      } finally {
+        await rm(sweepDir, { recursive: true, force: true });
+      }
+    });
+
+    it('sweeps an orphaned .tmp file (crash between writeFile and rename)', async () => {
+      const sweepDir = await mkdtemp(join(tmpdir(), 'car-status-sweep-'));
+      try {
+        // A real atomic-write temp is named "<pane>.json.<pid>.tmp" and may be
+        // half-written. Age it past the threshold via an explicit past mtime.
+        const orphan = join(sweepDir, 'default__2.json.9999.tmp');
+        await writeFile(orphan, '{"status":"monito');
+        const past = new Date((Math.floor(Date.now() / 1000) - 1000) * 1000);
+        await utimes(orphan, past, past);
+
+        const removed = await sweepStaleStatus(sweepDir, 300);
+        assert.equal(removed, 1);
+        assert.deepEqual(await readdir(sweepDir), []);
+      } finally {
+        await rm(sweepDir, { recursive: true, force: true });
+      }
+    });
+
+    it('leaves a fresh .tmp alone (a live writeStatus may be mid-rename)', async () => {
+      const sweepDir = await mkdtemp(join(tmpdir(), 'car-status-sweep-'));
+      try {
+        // Just-created temp with a current mtime — a concurrent writeStatus could be
+        // about to rename it into place, so the sweep must not race it away.
+        await writeFile(join(sweepDir, 'default__3.json.1234.tmp'), '{"status":"mon');
+        const removed = await sweepStaleStatus(sweepDir, 300);
+        assert.equal(removed, 0);
+        assert.deepEqual(await readdir(sweepDir), ['default__3.json.1234.tmp']);
       } finally {
         await rm(sweepDir, { recursive: true, force: true });
       }
