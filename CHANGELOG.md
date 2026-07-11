@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-07-11
+
 ### Added
 - `CLAUDE_AUTO_RETRY_LAUNCH_WRAPPER` env var: a prefix command prepended to each interactive
   session (e.g. `caffeinate -i` to keep macOS awake while Claude works). Generic and opt-in —
