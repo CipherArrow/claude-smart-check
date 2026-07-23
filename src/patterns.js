@@ -376,13 +376,24 @@ export function detectSafeguard(text, patterns = []) {
 // The anchors are config-supplied regexes whose FIRST capture group is the model name.
 const DOWNGRADE_MODEL_STOPWORDS = /\s+(?:Send feedback|Learn more|with \/feedback).*$/i;
 
-export function downgradeMatch(text, patterns = [], anchors = []) {
+// The real banner opens its own transcript block: "● Fable 5's safeguards flagged…".
+// Requiring the pattern to sit on a bullet-anchored line is what lets this detector scan
+// the WHOLE capture (unlike the tail-bounded error detectors): the banner is printed
+// mid-turn and the continuing response pushes it far above any short tail within seconds
+// (observed live: a 20-raw-line window missed it entirely), so the window must be wide —
+// and the bullet is the discriminator that keeps a wide window safe. The same phrases
+// QUOTED in a user prompt ("❯ …the banner says 'safeguards flagged…'") or discussed in
+// the model's own prose sit mid-line, never at a block start (both observed live).
+const DOWNGRADE_BULLET = /^\s*[●•]\s?/;
+
+export function downgradeMatch(text, patterns = [], anchors = [], { requireBullet = true } = {}) {
   if (!patterns || patterns.length === 0 || !anchors || anchors.length === 0) return null;
-  const lines = tail(text);
+  const lines = stripAnsi(text).split('\n');
   if (!lines.join('').trim()) return null;
   const regexes = toRegexes(patterns);
   const anchorRegexes = toRegexes(anchors);
   for (let i = 0; i < lines.length; i++) {
+    if (requireBullet && !DOWNGRADE_BULLET.test(lines[i])) continue;
     if (!regexes.some((r) => r.test(lines[i]))) continue;
     // Anchor within the same wrap-tolerant window the other detectors use; the anchor
     // line also yields the switched-to model name (capture group 1, wrap-trimmed).
@@ -401,7 +412,7 @@ export function downgradeMatch(text, patterns = [], anchors = []) {
           // must not re-trigger after it was handled. Content + switched-to model — a
           // fresh flag prints a fresh banner line but may be textually identical, so the
           // consumer additionally clears the remembered fingerprint once the banner
-          // leaves the live tail (mirrors _eventHandledBanner).
+          // leaves the capture entirely (mirrors _eventHandledBanner).
           fingerprint: `${lines[i].trim().slice(0, 200)}|${switchedTo}`,
         };
       }

@@ -327,7 +327,7 @@ async function smartcheckTick(state, tmuxAdapter, pane, config, stripped) {
   // A fresh flag banner while switching back: the new flag owns the pane — reclassify
   // (typically: back onto the fallback path, or a below-fallback halt).
   if (isBack) {
-    const m = downgradeMatch(stripped, sc.downgradePatterns, sc.downgradeAnchors);
+    const m = downgradeMatch(stripped, sc.downgradePatterns, sc.downgradeAnchors, { requireBullet: sc.downgradeRequireBullet });
     if (m && m.fingerprint !== smart.lastHandledBanner) {
       const res = handleSmartDowngrade(state, m, sc, working, now);
       await persistSmart(state, tmuxAdapter);
@@ -818,7 +818,7 @@ export async function processOneTick(state, tmuxAdapter, pane, config, isAlive, 
     // smart-check owns it — re-sending "continue" here would submit the flagged turn on
     // the downgraded model at the wrong effort. Mirrors the monitoring-branch gate.
     if (sc && sc.enabled && state.smart.enabled && !state.smart.halted) {
-      const dg = downgradeMatch(stripped, sc.downgradePatterns, sc.downgradeAnchors);
+      const dg = downgradeMatch(stripped, sc.downgradePatterns, sc.downgradeAnchors, { requireBullet: sc.downgradeRequireBullet });
       if (dg && dg.fingerprint !== state.smart.lastHandledBanner) {
         resetSafeguard(state);
         const res = handleSmartDowngrade(state, dg, sc, isWorking(stripped));
@@ -894,11 +894,11 @@ export async function processOneTick(state, tmuxAdapter, pane, config, isAlive, 
   const smart = state.smart;
   const workingNow = isWorking(stripped);
   const smartBanner = sc && sc.enabled
-    ? downgradeMatch(stripped, sc.downgradePatterns, sc.downgradeAnchors)
+    ? downgradeMatch(stripped, sc.downgradePatterns, sc.downgradeAnchors, { requireBullet: sc.downgradeRequireBullet })
     : null;
   const smartActive = sc && sc.enabled && smart.enabled;
   if (smartActive) {
-    // Banner left the live tail → a future identical render is a fresh incident
+    // Banner left the capture entirely → a future identical render is a fresh incident
     // (mirrors _eventHandledBanner).
     if (!smartBanner && smart.lastHandledBanner) {
       smart.lastHandledBanner = null;

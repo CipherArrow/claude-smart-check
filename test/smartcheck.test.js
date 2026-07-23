@@ -68,9 +68,43 @@ describe('downgradeMatch', () => {
   it('does NOT match the legacy API-Error render (no "Switched to" anchor)', () => {
     assert.equal(downgradeMatch(idleFrame(LEGACY_FLAG), SC.downgradePatterns, SC.downgradeAnchors), null);
   });
-  it('does NOT match a banner buried in scrollback with real work below it (tail discipline)', () => {
-    const work = Array.from({ length: 25 }, (_, i) => `  ⎿ compiled module ${i}`).join('\n');
-    assert.equal(downgradeMatch(idleFrame(BANNER_OPUS, work), SC.downgradePatterns, SC.downgradeAnchors), null);
+  it('MATCHES a banner deep in the capture with the continuing response below it (the live miss)', () => {
+    // Observed 2026-07-22: the flag fires mid-turn and the substitute model keeps
+    // streaming, pushing the banner far above any short tail within seconds. The
+    // detector must scan the whole capture.
+    const work = Array.from({ length: 40 }, (_, i) => `  ⎿ compiled module ${i}`).join('\n');
+    const m = downgradeMatch(idleFrame(BANNER_OPUS, work), SC.downgradePatterns, SC.downgradeAnchors);
+    assert.ok(m);
+    assert.equal(m.switchedTo, 'Opus 4.8');
+  });
+  it('does NOT match the banner quoted inside a user prompt (❯ render, mid-line phrases)', () => {
+    // Verbatim shape from a live pane: the user pasted the banner into their message.
+    const userQuote = [
+      '❯ by working withing the safeguards and not hitting them that provides this',
+      '  worarning to me or similar "Fable 5\'s safeguards flagged this message. The',
+      '  safeguards are intentionally',
+      '    broad right now and may flag safe and routine coding, cybersecurity, or',
+      '    biology work. Switched to Opus 4.8. Send',
+      '  feedback',
+      '    with /feedback or learn more" you are to keep working as Fable 5 on High',
+    ].join('\n');
+    assert.equal(downgradeMatch(idleFrame(userQuote), SC.downgradePatterns, SC.downgradeAnchors), null);
+  });
+  it("does NOT match the banner discussed in the model's own prose (mid-line, no block bullet)", () => {
+    // Verbatim shape from a live pane: both trigger phrases within 6 lines of each other.
+    const prose = [
+      '  interactive harness commands your CLI executes when you type them — they',
+      '  aren\'t tools exposed to the model, and a spawned agent operates through',
+      '  tools, not your command line. The "Fable 5\'s safeguards flagged this…',
+      '  Switched to Opus 4.8" behavior is a platform-level intervention that happens',
+      '  above me; by the time it fires, the switch has already occurred',
+    ].join('\n');
+    assert.equal(downgradeMatch(idleFrame(prose), SC.downgradePatterns, SC.downgradeAnchors), null);
+  });
+  it('bullet requirement: a bullet-less banner is rejected unless requireBullet is off', () => {
+    const noBullet = BANNER_OPUS.replace('● ', '');
+    assert.equal(downgradeMatch(idleFrame(noBullet), SC.downgradePatterns, SC.downgradeAnchors), null);
+    assert.ok(downgradeMatch(idleFrame(noBullet), SC.downgradePatterns, SC.downgradeAnchors, { requireBullet: false }));
   });
   it('legacy safeguardMatch still owns the API-Error render and ignores the ● banner', () => {
     assert.ok(safeguardMatch(idleFrame(LEGACY_FLAG), DEFAULT_SAFEGUARD.patterns));

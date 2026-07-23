@@ -79,6 +79,10 @@ export const DEFAULT_SMARTCHECK = {
     'intentionally broad right now',
   ],
   downgradeAnchors: ['Switched to\\s+([A-Za-z0-9 .\\-]+)'],
+  // The pattern must sit on a "●"-anchored line (the banner opens its own block). This is
+  // what makes the full-capture scan safe against the same phrases quoted in prompts or
+  // discussed in responses. Only disable if a harness update drops the bullet.
+  downgradeRequireBullet: true,
   // `command` must use a model ID or alias — the display name is rejected (probed
   // 2026-07-22 on v2.1.218: `/model Fable 5` → "Model 'Fable 5' not found"). The
   // confirm/picker renders DO use the display name.
@@ -232,6 +236,7 @@ function validateSmartCheck(raw) {
   s.enabled = typeof s.enabled === 'boolean' ? s.enabled : DEFAULT_SMARTCHECK.enabled;
   s.downgradePatterns = validPatterns(s.downgradePatterns, DEFAULT_SMARTCHECK.downgradePatterns);
   s.downgradeAnchors = validPatterns(s.downgradeAnchors, DEFAULT_SMARTCHECK.downgradeAnchors);
+  s.downgradeRequireBullet = typeof s.downgradeRequireBullet === 'boolean' ? s.downgradeRequireBullet : DEFAULT_SMARTCHECK.downgradeRequireBullet;
   const rawModels = raw && typeof raw === 'object' && raw.models && typeof raw.models === 'object' ? raw.models : {};
   s.models = {
     primary: validateModelSpec(rawModels.primary, DEFAULT_SMARTCHECK.models.primary),

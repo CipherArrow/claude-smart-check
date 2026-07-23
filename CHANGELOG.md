@@ -5,6 +5,21 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.1] - 2026-07-23 (local fork)
+
+### Fixed
+- **Downgrade banner missed when the turn keeps streaming** (observed live): the detector
+  inherited the error paths' short tail window (12 content / 20 raw lines), but the flag
+  fires mid-turn and the substitute model's continuing output pushes the banner past that
+  window within seconds — often before a single 5 s poll lands. `downgradeMatch` now
+  scans the whole 120-line capture, made safe by a new structural requirement: the
+  pattern must sit on a `●`-anchored line (the real banner opens its own block; the same
+  phrases quoted in a user prompt or discussed in the model's prose sit mid-line — both
+  verified against live pane captures, now regression fixtures). Knob:
+  `smartCheck.downgradeRequireBullet` (default true).
+- smartcheck-probe no longer auto-confirms Claude Code's folder-trust prompt; it shows
+  the dialog and waits for the human.
+
 ## [0.7.0] - 2026-07-22 (local fork)
 
 ### Added
