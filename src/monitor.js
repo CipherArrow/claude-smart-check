@@ -33,7 +33,7 @@ export function createSmartState() {
   return {
     // In-memory phase machinery (rebuilt from scratch on monitor restart; the durable
     // fields below rehydrate it via smart.pendingFallback re-entry).
-    phase: null, phaseDeadline: 0, preSendCount: 0, effortCycles: 0,
+    phase: null, phaseDeadline: 0, phaseStartedAt: 0, preSendCount: 0, effortCycles: 0,
     escSends: 0, pickerTried: false, wasWorking: false,
     forceBack: false, pendingRephrase: false, fingerprint: null,
     // 'usage-retry' while the restore-before-continue detour is active: the usage-limit
@@ -79,6 +79,7 @@ function safeTest(pattern, text) {
 function setSmartPhase(smart, phase, deadlineMs, now = Date.now()) {
   smart.phase = phase;
   smart.phaseDeadline = deadlineMs > 0 ? now + deadlineMs : 0;
+  smart.phaseStartedAt = now;   // the input-wait budget runs from phase entry
   smart.pickerTried = false;
 }
 
@@ -369,7 +370,9 @@ async function smartcheckTick(state, tmuxAdapter, pane, config, stripped) {
         return 'smartcheck-reinterrupt';
       }
       if (!isInputEmpty(stripped)) {
-        if (smart.phaseDeadline && now > smart.phaseDeadline) {
+        // Typed text means the user is present and mid-thought — wait it out on the
+        // generous input budget rather than the phase deadline.
+        if (now - smart.phaseStartedAt > sc.inputWaitTimeoutSeconds * 1000) {
           if (isBack) { smart.afterBack = null; smart.phase = null; state.status = 'monitoring'; return 'smartcheck-back-aborted'; }
           const r = smartGiveUp(state, 'input-not-empty');
           await persistSmart(state, tmuxAdapter);
@@ -450,7 +453,7 @@ async function smartcheckTick(state, tmuxAdapter, pane, config, stripped) {
         return 'smartcheck-waiting-idle';
       }
       if (!isInputEmpty(stripped)) {
-        if (smart.phaseDeadline && now > smart.phaseDeadline) {
+        if (now - smart.phaseStartedAt > sc.inputWaitTimeoutSeconds * 1000) {
           if (isBack) { const res = completeSmartBack(state); await persistSmart(state, tmuxAdapter); return res; }
           setSmartPhase(smart, 'nudge', sc.interruptTimeoutSeconds * 1000, now);
           return 'smartcheck-effort-skipped';
@@ -523,7 +526,7 @@ async function smartcheckTick(state, tmuxAdapter, pane, config, stripped) {
         return res;
       }
       if (!isInputEmpty(stripped)) {
-        if (smart.phaseDeadline && now > smart.phaseDeadline) {
+        if (now - smart.phaseStartedAt > sc.inputWaitTimeoutSeconds * 1000) {
           const res = completeSmartFallback(state, 'smartcheck-fallback-complete-nonudge');
           await persistSmart(state, tmuxAdapter);
           return res;

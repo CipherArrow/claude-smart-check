@@ -437,15 +437,22 @@ export function confirmationCount(text, pattern) {
 // the user is composing (the switch-back commands, the resume nudge). Scans bottom-up for
 // the first input-row render; an input row we can't find or read counts as NOT empty —
 // when in doubt, don't type.
+//
+// Placeholder ghost text: an EMPTY idle input renders a dim suggestion —
+// `❯ Try "refactor <filepath>"` — which survives stripAnsi looking exactly like typed
+// text (observed live: it blocked every injection on a stock render). Content matching
+// the placeholder shape counts as empty. Residual risk: a user who has literally typed
+// `Try "…` reads as empty — accepted; the alternative (never typing on this render) made
+// the whole feature inert.
 const INPUT_ROW_BOXED = /^\s*│\s*[>❯]\s*(.*?)\s*│\s*$/;   // "│ > text │"
 const INPUT_ROW_BARE = /^\s*[>❯]\s*(\S.*)?$/;              // "> text" / bare "❯"
+const INPUT_PLACEHOLDER = /^Try ["'"']/;
 export function isInputEmpty(text, scanLines = 15) {
   const lines = stripAnsi(text).split('\n');
   for (let i = lines.length - 1; i >= Math.max(0, lines.length - scanLines); i--) {
     let m = INPUT_ROW_BOXED.exec(lines[i]);
-    if (m) return !m[1];
-    m = INPUT_ROW_BARE.exec(lines[i]);
-    if (m) return !m[1];
+    if (!m) m = INPUT_ROW_BARE.exec(lines[i]);
+    if (m) return !m[1] || INPUT_PLACEHOLDER.test(m[1]);
   }
   return false;
 }

@@ -108,6 +108,10 @@ export const DEFAULT_SMARTCHECK = {
   switchBackCooldownMinutes: 10,
   verifyTimeoutSeconds: 30,
   interruptTimeoutSeconds: 60,
+  // How long a send phase will wait for the user's input box to empty out before
+  // abandoning the sequence. Generous — genuinely typed text means the user is present
+  // and mid-thought; abandoning at 60s lost a promote to a half-typed message.
+  inputWaitTimeoutSeconds: 300,
   // Extra settle between typing a slash command and the submitting Enter — the command
   // palette popup needs longer than the plain-message SUBMIT_DELAY_MS.
   commandSettleMs: 300,
@@ -255,6 +259,7 @@ function validateSmartCheck(raw) {
   s.switchBackCooldownMinutes = validNumber(s.switchBackCooldownMinutes, 0, DEFAULT_SMARTCHECK.switchBackCooldownMinutes);
   s.verifyTimeoutSeconds = validNumber(s.verifyTimeoutSeconds, 5, DEFAULT_SMARTCHECK.verifyTimeoutSeconds);
   s.interruptTimeoutSeconds = validNumber(s.interruptTimeoutSeconds, 5, DEFAULT_SMARTCHECK.interruptTimeoutSeconds);
+  s.inputWaitTimeoutSeconds = validNumber(s.inputWaitTimeoutSeconds, 10, DEFAULT_SMARTCHECK.inputWaitTimeoutSeconds);
   s.commandSettleMs = clamp(s.commandSettleMs, 50, 5000, DEFAULT_SMARTCHECK.commandSettleMs);
   s.assumeModelOnStart = s.assumeModelOnStart === 'fallback' || s.assumeModelOnStart === 'opus' ? 'fallback' : 'primary';
   // Accept the fableUnavailablePatterns spelling from early docs as an alias.

@@ -127,6 +127,14 @@ describe('confirmationCount / isInputEmpty / picker helpers', () => {
     assert.equal(isInputEmpty('stuff\n❯ '), true);
     assert.equal(isInputEmpty('stuff\n❯ typed'), false);
   });
+  it('placeholder ghost text counts as empty (the live blocker)', () => {
+    // Observed live: an EMPTY idle input renders a dim suggestion that survives
+    // ANSI-stripping as ordinary text and blocked every injection.
+    assert.equal(isInputEmpty('stuff\n❯ Try "refactor <filepath>"'), true);
+    assert.equal(isInputEmpty('stuff\n❯ Try "edit <filepath> to..."'), true);
+    assert.equal(isInputEmpty('stuff\n│ > Try "how does <filepath> work?" │\nfooter'), true);
+    assert.equal(isInputEmpty('stuff\n❯ fix the flaky test'), false);
+  });
   it('detects an open picker and computes steps to an option', () => {
     const picker = ['Select model:', '  1. Fable 5', '❯ 2. Default', '  3. Opus 4.8', ''].join('\n');
     assert.equal(isPickerOpen(picker), true);
@@ -182,6 +190,15 @@ describe('smartcheck fallback sequence', () => {
     assert.equal(state.smart.pendingFallback, false);
     assert.ok(t._saved);
     assert.equal(t._saved.currentModel, 'fallback');
+  });
+
+  it('promotes on the real bare-prompt render with placeholder ghost text (the live give-up)', async () => {
+    const realIdle = (...content) => [...content, '', '❯ Try "refactor <filepath>"', '  ⏸ manual mode on · ? for shortcuts · ← 1 agent', ''].join('\n');
+    const state = createMonitorState();
+    const t = mockTmux([realIdle(BANNER_OPUS), realIdle(BANNER_OPUS)]);
+    assert.equal(await tick(state, t), 'smartcheck-downgrade-detected-idle');
+    assert.equal(await tick(state, t), 'smartcheck-model-sent');
+    assert.deepEqual(t._commands, [SC.models.fallback.command]);
   });
 
   it('never sends Escape when the banner arrives at an idle prompt', async () => {

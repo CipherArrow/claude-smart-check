@@ -5,6 +5,18 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.2] - 2026-07-23 (local fork)
+
+### Fixed
+- **Placeholder ghost text made every empty input look non-empty** (observed live: the
+  0.7.1 promote gave up with "input-not-empty" on an idle pane, and the quiet-period
+  switch-back could never have fired). An empty idle input renders a dim suggestion
+  (`❯ Try "refactor <filepath>"`) that survives ANSI-stripping as ordinary text;
+  `isInputEmpty` now treats the placeholder shape as empty.
+- Input-not-empty no longer abandons a sequence after the 60 s phase deadline: genuinely
+  typed text means the user is present, so send phases now wait on a dedicated budget
+  (`smartCheck.inputWaitTimeoutSeconds`, default 300 s) before giving up.
+
 ## [0.7.1] - 2026-07-23 (local fork)
 
 ### Fixed
