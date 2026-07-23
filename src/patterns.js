@@ -384,7 +384,10 @@ const DOWNGRADE_MODEL_STOPWORDS = /\s+(?:Send feedback|Learn more|with \/feedbac
 // and the bullet is the discriminator that keeps a wide window safe. The same phrases
 // QUOTED in a user prompt ("❯ …the banner says 'safeguards flagged…'") or discussed in
 // the model's own prose sit mid-line, never at a block start (both observed live).
-const DOWNGRADE_BULLET = /^\s*[●•]\s?/;
+// Column 0, no leading whitespace: Claude Code renders transcript block bullets flush
+// left, while every wrapped continuation line — including one inside a user message that
+// QUOTES the banner — is indented. Verified against live captures of both.
+const DOWNGRADE_BULLET = /^[●•]\s?/;
 
 export function downgradeMatch(text, patterns = [], anchors = [], { requireBullet = true } = {}) {
   if (!patterns || patterns.length === 0 || !anchors || anchors.length === 0) return null;
@@ -417,6 +420,31 @@ export function downgradeMatch(text, patterns = [], anchors = [], { requireBulle
         };
       }
     }
+  }
+  return null;
+}
+
+// --- "The primary model can't be used right now" ---
+// An ERROR/system render, never prose. Live false positive (2026-07-23): the sentence
+// "…i ran out of credits to use Fable 5", typed by the user in an ordinary conversation,
+// matched /out of .*credits/ and pinned the session to the fallback model (and injected a
+// nudge). Two structural guards: the match must carry a system-render anchor nearby
+// (slash-command output "⎿", a warning glyph, an "API Error" line, the "/upgrade" hint),
+// and user-input echo lines ("❯ …") are never eligible — that is where prose lives.
+const USER_ECHO = /^\s*[❯>]\s/;
+export const DEFAULT_UNAVAILABLE_ANCHORS = ['^\\s*⎿', '^\\s*⚠', '\\bAPI Error\\b', '/upgrade\\b'];
+
+export function unavailableMatch(text, patterns = [], anchors = DEFAULT_UNAVAILABLE_ANCHORS) {
+  if (!patterns || patterns.length === 0) return null;
+  const lines = tail(text);
+  if (!lines.join('').trim()) return null;
+  const regexes = toRegexes(patterns);
+  const anchorRegexes = toRegexes(anchors && anchors.length ? anchors : DEFAULT_UNAVAILABLE_ANCHORS);
+  for (let i = 0; i < lines.length; i++) {
+    if (USER_ECHO.test(lines[i])) continue;
+    if (!regexes.some((r) => r.test(lines[i]))) continue;
+    if (!hasNearbyMatch(lines, i, anchorRegexes)) continue;
+    return { line: lines[i].trim().slice(0, 200) };
   }
   return null;
 }

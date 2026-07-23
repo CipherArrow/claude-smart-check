@@ -127,6 +127,11 @@ export const DEFAULT_SMARTCHECK = {
     'is (currently )?unavailable',
     'insufficient .*credits',
   ],
+  // A pattern only counts as a real "model unusable" signal when one of these renders
+  // sits within a few lines of it — slash-command output, a warning glyph, an API error,
+  // or the upgrade hint. Without this, ordinary conversation ABOUT credits pins the
+  // session (observed live). User-input echo lines are excluded outright.
+  primaryUnavailableAnchors: ['^\\s*⎿', '^\\s*⚠', '\\bAPI Error\\b', '/upgrade\\b'],
 };
 
 export const DEFAULT_CONFIG = {
@@ -265,6 +270,7 @@ function validateSmartCheck(raw) {
   // Accept the fableUnavailablePatterns spelling from early docs as an alias.
   const unavailRaw = s.primaryUnavailablePatterns ?? s.fableUnavailablePatterns;
   s.primaryUnavailablePatterns = validPatterns(unavailRaw, DEFAULT_SMARTCHECK.primaryUnavailablePatterns);
+  s.primaryUnavailableAnchors = validPatterns(s.primaryUnavailableAnchors, DEFAULT_SMARTCHECK.primaryUnavailableAnchors);
   delete s.fableUnavailablePatterns;
   return s;
 }

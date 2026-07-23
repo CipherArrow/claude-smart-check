@@ -5,6 +5,27 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.3] - 2026-07-23 (local fork)
+
+### Fixed
+- **Conversation about credits pinned the session** (live false positive): the sentence
+  "…i ran out of credits to use Fable 5", typed by a user in an ordinary chat, matched
+  `out of .*credits` and made smart-check declare the primary model unavailable — pinning
+  the fallback and injecting a nudge into a session that needed neither. Unavailable
+  detection is now anchored like every other detector: the match must sit within a few
+  lines of a system render (`⎿` command output, `⚠`, an `API Error` line, the `/upgrade`
+  hint), and user-input echo lines (`❯ …`) are never eligible. Knob:
+  `smartCheck.primaryUnavailableAnchors`.
+- **Downgrade banner bullet tightened to column 0.** Claude Code renders transcript
+  bullets flush left; every wrapped continuation line — including inside a user message
+  quoting the banner — is indented. Removes the last quoting false-positive vector.
+- **Confirmation dialogs are now driven the moment they appear.** `/effort Max` can open
+  a "Change effort level? ❯ 1. Yes, switch to max" dialog (it appears when the
+  conversation is cached at the current level); the old post-deadline fallback confirmed
+  it only after a full 30 s verify timeout. The verify phases now drive a locatable
+  dialog immediately — and still refuse to press Enter on one whose target option they
+  cannot find.
+
 ## [0.7.2] - 2026-07-23 (local fork)
 
 ### Fixed

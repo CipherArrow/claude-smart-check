@@ -4,6 +4,7 @@ import {
   downgradeMatch, confirmationCount, isInputEmpty, isPickerOpen, menuStepsToOption,
   safeguardMatch,
 } from '../src/patterns.js';
+import * as P from '../src/patterns.js';
 import { DEFAULT_CONFIG, DEFAULT_SMARTCHECK, DEFAULT_SAFEGUARD, loadConfig } from '../src/config.js';
 import { createMonitorState, processOneTick, applySmartCommand, smartDurableFields, adoptSmartState } from '../src/monitor.js';
 
@@ -109,6 +110,31 @@ describe('downgradeMatch', () => {
   it('legacy safeguardMatch still owns the API-Error render and ignores the ● banner', () => {
     assert.ok(safeguardMatch(idleFrame(LEGACY_FLAG), DEFAULT_SAFEGUARD.patterns));
     assert.equal(safeguardMatch(idleFrame(BANNER_OPUS), DEFAULT_SAFEGUARD.patterns), null);
+  });
+});
+
+describe('unavailableMatch (anchored)', () => {
+  it('does NOT match conversational prose about credits (the live false positive)', () => {
+    // Verbatim from a live pane: this sentence pinned the session to the fallback model
+    // and injected a nudge, purely because it was being discussed.
+    const prose = [
+      '❯ still watching its model upgrade. Currently i have a the',
+      '  sessions "Anima System Project" open in another ghosty terminal window and',
+      '  claude is coding in it because i ran out of credits to use Fable 5 so i',
+      '  manually set it to Claude Opus 4.8 and at max effort.',
+    ].join('\n');
+    assert.equal(P.unavailableMatch(prose, SC.primaryUnavailablePatterns, SC.primaryUnavailableAnchors), null);
+  });
+  it('matches a real command-output error render (⎿ anchor)', () => {
+    const render = ['❯ /model claude-fable-5[1m]', '  ⎿  Error: you are out of usage credits for this model'].join('\n');
+    assert.ok(P.unavailableMatch(render, SC.primaryUnavailablePatterns, SC.primaryUnavailableAnchors));
+  });
+  it('matches an API Error render', () => {
+    const render = ['● API Error: Fable 5 is currently unavailable'].join('\n');
+    assert.ok(P.unavailableMatch(render, SC.primaryUnavailablePatterns, SC.primaryUnavailableAnchors));
+  });
+  it('ignores a pattern with no system anchor nearby', () => {
+    assert.equal(P.unavailableMatch('  some model is currently unavailable, apparently', SC.primaryUnavailablePatterns, SC.primaryUnavailableAnchors), null);
   });
 });
 
@@ -247,6 +273,47 @@ describe('smartcheck fallback sequence', () => {
     assert.equal(await tick(state, t), 'smartcheck-picker-driven');
     assert.deepEqual(t._keys, ['Down', 'Enter']);
     assert.equal(await tick(state, t), 'smartcheck-model-verified');
+  });
+
+  it('confirms the "Change effort level?" dialog immediately, without waiting out the verify timeout', async () => {
+    // Verbatim render from a live promote (screenshot 2026-07-22 23:20): /effort Max
+    // opened this dialog and the old post-deadline fallback stalled ~30s before Enter.
+    const EFFORT_DIALOG = [
+      '❯ /effort Max',
+      '',
+      'Change effort level?',
+      'Your next response will be slower and use more tokens',
+      '',
+      'This conversation is cached for the current effort level. Switching to max',
+      'means the full history gets re-read on your next message.',
+      '',
+      '❯ 1. Yes, switch to max',
+      '  2. No, go back',
+    ].join('\n');
+    const state = createMonitorState();
+    state.status = 'smartcheck';
+    state.smart.phase = 'verify-effort';
+    state.smart.fingerprint = 'f';
+    state.smart.preSendCount = 0;
+    state.smart.phaseDeadline = Date.now() + 30_000;   // deadline NOT expired
+    state.smart.phaseStartedAt = Date.now();
+    const t = mockTmux([EFFORT_DIALOG, idleFrame('Set effort level to max')]);
+    assert.equal(await tick(state, t), 'smartcheck-picker-driven');
+    assert.deepEqual(t._keys, ['Enter']);              // cursor already on option 1
+    assert.equal(await tick(state, t), 'smartcheck-effort-verified');
+  });
+
+  it('never confirms a dialog whose target option cannot be located', async () => {
+    const FOREIGN = ['Delete everything?', '❯ 1. Yes, delete', '  2. Cancel'].join('\n');
+    const state = createMonitorState();
+    state.status = 'smartcheck';
+    state.smart.phase = 'verify-effort';
+    state.smart.preSendCount = 0;
+    state.smart.phaseDeadline = Date.now() + 30_000;
+    state.smart.phaseStartedAt = Date.now();
+    const t = mockTmux([FOREIGN]);
+    assert.equal(await tick(state, t), 'smartcheck-verifying');
+    assert.deepEqual(t._keys, []);
   });
 
   it('falls back to cycling bare /effort when the argument form is not confirmed', async () => {

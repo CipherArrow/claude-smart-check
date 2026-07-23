@@ -1,4 +1,4 @@
-import { stripAnsi, isRateLimited, findRateLimitMessage, isRateLimitOptionsPrompt, menuStepsToWaitOption, detectOverload, overloadMatch, detectSafeguard, safeguardMatch, isWorking, downgradeMatch, confirmationCount, isInputEmpty, isPickerOpen, menuStepsToOption, liveTailText } from './patterns.js';
+import { stripAnsi, isRateLimited, findRateLimitMessage, isRateLimitOptionsPrompt, menuStepsToWaitOption, detectOverload, overloadMatch, detectSafeguard, safeguardMatch, isWorking, downgradeMatch, confirmationCount, isInputEmpty, isPickerOpen, menuStepsToOption, unavailableMatch } from './patterns.js';
 import { parseResetTime, calculateWaitMs } from './time-parser.js';
 import { capturePane, sendKeys, sendKey, sendCommand, getPaneCommand, isProcessForeground } from './tmux.js';
 import { loadConfig } from './config.js';
@@ -304,6 +304,29 @@ function enterOverload(state, overload, rand) {
   return 'overload-detected';
 }
 
+// A numbered selector/confirmation dialog is on screen and we can locate the option we
+// want: move the cursor there and confirm. Returns a result token when it acted, else
+// null (no dialog, layout unreadable, already tried once, or foreground unsafe). Only
+// called from the verify phases — i.e. immediately after smart-check itself submitted
+// the slash command whose dialog this is.
+async function driveSmartPicker(state, tmuxAdapter, pane, config, stripped, spec, now) {
+  const smart = state.smart;
+  if (smart.pickerTried || !isPickerOpen(stripped)) return null;
+  const steps = menuStepsToOption(stripped, spec.pickerOption);
+  if (steps === null) return null;   // unreadable → never press Enter (could confirm "No")
+  const fg = await checkForeground(tmuxAdapter, pane, config);
+  if (!fg.ok) { state._lastForeground = fg.fg; return 'skipped-not-claude'; }
+  const key = steps >= 0 ? 'Down' : 'Up';
+  for (let i = 0; i < Math.abs(steps); i++) {
+    await tmuxAdapter.sendKey(pane, key);
+    await new Promise((r) => setTimeout(r, 80));
+  }
+  await tmuxAdapter.sendKey(pane, 'Enter');
+  smart.pickerTried = true;
+  smart.phaseDeadline = now + config.smartCheck.verifyTimeoutSeconds * 1000;
+  return 'smartcheck-picker-driven';
+}
+
 // --- Smart-check phase tick (state.status === 'smartcheck') ---
 // Verified, sequential recovery: every send is confirmed from the pane render before the
 // next one fires, every phase has a deadline, and every failure path is a loud no-op
@@ -400,38 +423,27 @@ async function smartcheckTick(state, tmuxAdapter, pane, config, stripped) {
       // model unavailable) pins the session to the fallback immediately. During the
       // restore-before-continue detour the pending usage retry still goes out — on the
       // fallback model (never a lockout).
-      if (isBack && sc.primaryUnavailablePatterns.some((p) => safeTest(p, liveTailText(stripped)))) {
+      if (isBack && unavailableMatch(stripped, sc.primaryUnavailablePatterns, sc.primaryUnavailableAnchors)) {
         smart.primaryUnavailable = true;
         smart.forceBack = false;
         abortBackToStatus(state);
         await persistSmart(state, tmuxAdapter);
         return 'smartcheck-primary-unavailable';
       }
+      // A selector or confirmation dialog is up ("Change effort level? ❯ 1. Yes, switch
+      // to max", the /model picker) — drive it the moment it appears. Waiting for the
+      // verify deadline first stalled a live promote for a full 30 s (observed).
+      const drove = await driveSmartPicker(state, tmuxAdapter, pane, config, stripped, spec, now);
+      if (drove) return drove;
       if (working) {
         if (isBack) { smart.afterBack = null; smart.phase = null; state.status = 'monitoring'; return 'smartcheck-back-aborted'; }
         smart.phaseDeadline = now + sc.verifyTimeoutSeconds * 1000;
         return 'smartcheck-waiting-idle';
       }
       if (now <= smart.phaseDeadline) return 'smartcheck-verifying';
-      // Deadline passed with no confirmation. Maybe the command opened its picker.
-      if (isPickerOpen(stripped) && !smart.pickerTried) {
-        const steps = menuStepsToOption(stripped, spec.pickerOption);
-        if (steps !== null) {
-          const fgp = await checkForeground(tmuxAdapter, pane, config);
-          if (!fgp.ok) { state._lastForeground = fgp.fg; return 'skipped-not-claude'; }
-          const key = steps >= 0 ? 'Down' : 'Up';
-          for (let i = 0; i < Math.abs(steps); i++) {
-            await tmuxAdapter.sendKey(pane, key);
-            await new Promise((r) => setTimeout(r, 80));
-          }
-          await tmuxAdapter.sendKey(pane, 'Enter');
-          smart.pickerTried = true;
-          smart.phaseDeadline = now + sc.verifyTimeoutSeconds * 1000;
-          return 'smartcheck-picker-driven';
-        }
-        // Unreadable picker layout: close the modal rather than leave it up, then fail.
-        await tmuxAdapter.sendKey(pane, 'Escape');
-      }
+      // Deadline passed with no confirmation and no drivable dialog. If a modal we can't
+      // read is still up, close it rather than leave the session wedged behind it.
+      if (isPickerOpen(stripped)) await tmuxAdapter.sendKey(pane, 'Escape');
       if (isBack) {
         smart.primaryUnavailable = true;
         smart.forceBack = false;
@@ -477,29 +489,15 @@ async function smartcheckTick(state, tmuxAdapter, pane, config, stripped) {
         setSmartPhase(smart, 'nudge', sc.interruptTimeoutSeconds * 1000, now);
         return 'smartcheck-effort-verified';
       }
+      // "Change effort level? … ❯ 1. Yes, switch to max" — confirm it immediately.
+      const droveEffort = await driveSmartPicker(state, tmuxAdapter, pane, config, stripped, spec, now);
+      if (droveEffort) return droveEffort;
       if (working) {
         smart.phaseDeadline = now + sc.verifyTimeoutSeconds * 1000;
         return 'smartcheck-waiting-idle';
       }
       if (now <= smart.phaseDeadline) return 'smartcheck-verifying';
-      // Maybe /effort opened a selector — drive it to the target option.
-      if (isPickerOpen(stripped) && !smart.pickerTried) {
-        const steps = menuStepsToOption(stripped, spec.pickerOption);
-        if (steps !== null) {
-          const fgp = await checkForeground(tmuxAdapter, pane, config);
-          if (!fgp.ok) { state._lastForeground = fgp.fg; return 'skipped-not-claude'; }
-          const key = steps >= 0 ? 'Down' : 'Up';
-          for (let i = 0; i < Math.abs(steps); i++) {
-            await tmuxAdapter.sendKey(pane, key);
-            await new Promise((r) => setTimeout(r, 80));
-          }
-          await tmuxAdapter.sendKey(pane, 'Enter');
-          smart.pickerTried = true;
-          smart.phaseDeadline = now + sc.verifyTimeoutSeconds * 1000;
-          return 'smartcheck-picker-driven';
-        }
-        await tmuxAdapter.sendKey(pane, 'Escape');
-      }
+      if (isPickerOpen(stripped)) await tmuxAdapter.sendKey(pane, 'Escape');
       // Maybe `/effort <level>` ignores its argument and bare /effort cycles levels:
       // keep cycling (bounded to a full wrap) until the target confirmation appears.
       if (smart.effortCycles < sc.effort.maxCycles) {
@@ -936,7 +934,7 @@ export async function processOneTick(state, tmuxAdapter, pane, config, isAlive, 
     // primary-unusable render (credits ran out after a verified switch). Pin + re-promote
     // so the session stays usable on the fallback.
     if (smart.currentModel === 'primary' && !workingNow
-        && sc.primaryUnavailablePatterns.some((p) => safeTest(p, liveTailText(stripped)))) {
+        && unavailableMatch(stripped, sc.primaryUnavailablePatterns, sc.primaryUnavailableAnchors)) {
       smart.primaryUnavailable = true;
       beginSmartFallback(state, null, false, sc);
       await persistSmart(state, tmuxAdapter);
