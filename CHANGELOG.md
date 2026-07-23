@@ -5,6 +5,26 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.0] - 2026-07-22 (local fork)
+
+### Added
+- **smart-check**: safeguard-downgrade model/effort recovery. When Claude Code's own
+  `switchModelsOnFlag` downgrade banner ("…safeguards flagged this message… Switched to
+  Opus 4.8…") appears, the monitor interrupts the in-flight turn (Escape, only while the
+  working footer is visible), submits the fallback `/model` command, verifies the
+  "Set model to …" confirmation from the pane, then (only after that) the fallback
+  `/effort` command, verifies it, and sends a resume nudge. After a quiet period
+  (N clean turns + cooldown, idle, empty input) it restores the primary model + effort
+  the same verified way. A switch to anything BELOW the fallback model halts ALL
+  automation (zero keystrokes) until a human decision. If the primary model is
+  unavailable (usage credits exhausted), the session pins to the fallback so coding is
+  never blocked. Every matched/typed string is config-overridable in
+  `~/.claude-auto-retry.json` (`smartCheck` block) so harness wording changes are a
+  config edit. New CLI: `claude smart-check [status|back|stay|resume|rephrase|on|off]`
+  (also `claude-auto-retry smart-check …`). Durable per-pane session state survives
+  reconcile monitor replacement; tmux segment shows `🔵AR⇄` (switching), `·O` (on
+  fallback), `📌` (pinned), `🔴AR HALT` (halted).
+
 ## [Unreleased]
 
 ### Fixed

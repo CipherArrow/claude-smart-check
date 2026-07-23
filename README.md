@@ -1,3 +1,34 @@
+# claude-smart-check
+
+> A [claude-auto-retry](https://github.com/cheapestinference/claude-auto-retry) fork that
+> adds **smart-check**: automatic model/effort recovery when Claude Code's safeguards
+> downgrade your session — plus everything the base tool already does (rate-limit
+> auto-resume, overload backoff).
+
+When a safeguard flag switches your session from your primary model (e.g. **Fable 5 @
+High**) to the fallback (**Opus 4.8**), smart-check stops the downgraded turn, promotes
+the fallback to **Max effort** (every keystroke verified from the terminal render), nudges
+the work onward, and restores your primary model + effort once a quiet period passes. A
+downgrade below the fallback halts ALL automation for a human decision; exhausted credits
+pin the fallback so you're never locked out. **Linux-first** (Arch primary; installer
+detects Debian/RHEL/Alpine too).
+
+- **[SMART-CHECK.md](SMART-CHECK.md)** — how it works + the full security model
+- **[AGENTS.md](AGENTS.md)** — hand this to an AI agent to install it for you
+- **[COMPATIBILITY.md](COMPATIBILITY.md)** — base-tool architecture & integration rules
+- **[FORK-NOTES.md](FORK-NOTES.md)** — upgrading this fork safely against upstream
+
+```bash
+git clone https://github.com/CipherArrow/claude-smart-check
+cd claude-smart-check && npm test && npm install -g .
+claude-auto-retry install && claude-auto-retry install-hook && claude-auto-retry install-timer
+# then set "switchModelsOnFlag": true in ~/.claude/settings.json (see SMART-CHECK.md)
+```
+
+Everything below this line is the base tool's documentation (all of it still applies).
+
+---
+
 # claude-auto-retry
 
 > Automatically retry Claude Code sessions when you hit Anthropic subscription rate limits.

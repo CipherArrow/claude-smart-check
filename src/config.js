@@ -64,6 +64,63 @@ export const DEFAULT_SAFEGUARD = {
   retryMessage: 'continue',
 };
 
+// Smart-check: cooperate with Claude Code's own safeguard model-downgrade
+// (switchModelsOnFlag). When a flag banner switches the session to the FALLBACK model,
+// promote it to the fallback effort and nudge the work onward; once a quiet period passes
+// with no further flags, restore the PRIMARY model + effort. A switch to anything below
+// the fallback model halts all automation for a human decision. Every matched and typed
+// string lives here so a Claude Code wording change is a config edit, not a code fix.
+export const DEFAULT_SMARTCHECK = {
+  enabled: true,
+  // Banner phrases (any one) + an anchor whose capture group 1 is the switched-to model.
+  // Both matched in the same chrome-aware live tail the other detectors use.
+  downgradePatterns: [
+    'safeguards flagged this message',
+    'intentionally broad right now',
+  ],
+  downgradeAnchors: ['Switched to\\s+([A-Za-z0-9 .\\-]+)'],
+  // `command` must use a model ID or alias — the display name is rejected (probed
+  // 2026-07-22 on v2.1.218: `/model Fable 5` → "Model 'Fable 5' not found"). The
+  // confirm/picker renders DO use the display name.
+  models: {
+    primary: { name: 'Fable 5', command: '/model claude-fable-5[1m]', confirm: 'Set model to Fable 5', pickerOption: 'Fable 5' },
+    fallback: { name: 'Opus 4\\.8', command: '/model claude-opus-4-8', confirm: 'Set model to Opus 4\\.8', pickerOption: 'Opus 4\\.8' },
+  },
+  effort: {
+    primary: { command: '/effort High', confirm: 'Set effort level to high', pickerOption: '\\bhigh\\b' },
+    fallback: { command: '/effort Max', confirm: 'Set effort level to max', pickerOption: '\\bmax\\b' },
+    // Bare-/effort cycling fallback bound. 6 covers a full wrap of the known effort
+    // levels, so if `/effort <level>` ignores its argument the cycle always reaches the
+    // target instead of stranding the SAVED default on an intermediate level.
+    maxCycles: 6,
+  },
+  nudgeMessage: 'Continue — take into account my last message and what you were in the middle of doing in the project.',
+  // A switch to any model other than models.fallback halts automation (no keystrokes at
+  // all) until `claude smart-check resume` / `rephrase`. Fail-safe: an unparseable model
+  // name is treated as below-fallback.
+  haltBelowFallback: true,
+  rephraseMessage: 'The previous message was flagged and the session was downgraded. Rewrite my last request so it fully complies with the usage policy while preserving the technical goal, state the rewritten request, then continue the work using it.',
+  cleanTurnsBeforeSwitchBack: 3,
+  switchBackCooldownMinutes: 10,
+  verifyTimeoutSeconds: 30,
+  interruptTimeoutSeconds: 60,
+  // Extra settle between typing a slash command and the submitting Enter — the command
+  // palette popup needs longer than the plain-message SUBMIT_DELAY_MS.
+  commandSettleMs: 300,
+  // What model to assume for a pane with no prior smart-check state: 'primary' (matches
+  // a settings.json that pins the primary model) or 'fallback'.
+  assumeModelOnStart: 'primary',
+  // Renders that mean the primary model cannot be used right now (usage credits gone,
+  // model unavailable). Checked during switch-back; a match pins the session to the
+  // fallback so the user is never locked out of coding.
+  primaryUnavailablePatterns: [
+    'out of .*credits',
+    'usage credits .*(exhausted|depleted)',
+    'is (currently )?unavailable',
+    'insufficient .*credits',
+  ],
+};
+
 export const DEFAULT_CONFIG = {
   maxRetries: 5,
   pollIntervalSeconds: 5,
@@ -73,6 +130,7 @@ export const DEFAULT_CONFIG = {
   customPatterns: [],
   overload: DEFAULT_OVERLOAD,
   safeguard: DEFAULT_SAFEGUARD,
+  smartCheck: DEFAULT_SMARTCHECK,
 };
 
 const CONFIG_PATH = join(homedir(), '.claude-auto-retry.json');
@@ -141,6 +199,66 @@ function validateSafeguard(raw) {
   return s;
 }
 
+// Keep only non-empty strings that compile as regexes (same policy as the other
+// pattern lists); fall back to the defaults when nothing survives.
+function validPatterns(raw, defaults) {
+  const pats = Array.isArray(raw)
+    ? raw.filter(p => {
+        if (typeof p !== 'string' || p.length === 0) return false;
+        try { new RegExp(p); return true; } catch { return false; }
+      })
+    : [];
+  return pats.length > 0 ? pats : [...defaults];
+}
+
+function validString(val, fallback) {
+  return typeof val === 'string' && val ? val : fallback;
+}
+
+function validateModelSpec(raw, defaults) {
+  const m = { ...defaults, ...(raw && typeof raw === 'object' ? raw : {}) };
+  for (const key of Object.keys(defaults)) {
+    m[key] = validString(m[key], defaults[key]);
+    // name/confirm/pickerOption are used as regexes — an invalid one must not crash a tick.
+    if (key !== 'command') {
+      try { new RegExp(m[key]); } catch { m[key] = defaults[key]; }
+    }
+  }
+  return m;
+}
+
+function validateSmartCheck(raw) {
+  const s = { ...DEFAULT_SMARTCHECK, ...(raw && typeof raw === 'object' ? raw : {}) };
+  s.enabled = typeof s.enabled === 'boolean' ? s.enabled : DEFAULT_SMARTCHECK.enabled;
+  s.downgradePatterns = validPatterns(s.downgradePatterns, DEFAULT_SMARTCHECK.downgradePatterns);
+  s.downgradeAnchors = validPatterns(s.downgradeAnchors, DEFAULT_SMARTCHECK.downgradeAnchors);
+  const rawModels = raw && typeof raw === 'object' && raw.models && typeof raw.models === 'object' ? raw.models : {};
+  s.models = {
+    primary: validateModelSpec(rawModels.primary, DEFAULT_SMARTCHECK.models.primary),
+    fallback: validateModelSpec(rawModels.fallback, DEFAULT_SMARTCHECK.models.fallback),
+  };
+  const rawEffort = raw && typeof raw === 'object' && raw.effort && typeof raw.effort === 'object' ? raw.effort : {};
+  s.effort = {
+    primary: validateModelSpec(rawEffort.primary, DEFAULT_SMARTCHECK.effort.primary),
+    fallback: validateModelSpec(rawEffort.fallback, DEFAULT_SMARTCHECK.effort.fallback),
+    maxCycles: validNumber(rawEffort.maxCycles, 1, DEFAULT_SMARTCHECK.effort.maxCycles),
+  };
+  s.nudgeMessage = validString(s.nudgeMessage, DEFAULT_SMARTCHECK.nudgeMessage);
+  s.haltBelowFallback = typeof s.haltBelowFallback === 'boolean' ? s.haltBelowFallback : DEFAULT_SMARTCHECK.haltBelowFallback;
+  s.rephraseMessage = validString(s.rephraseMessage, DEFAULT_SMARTCHECK.rephraseMessage);
+  s.cleanTurnsBeforeSwitchBack = validNumber(s.cleanTurnsBeforeSwitchBack, 1, DEFAULT_SMARTCHECK.cleanTurnsBeforeSwitchBack);
+  s.switchBackCooldownMinutes = validNumber(s.switchBackCooldownMinutes, 0, DEFAULT_SMARTCHECK.switchBackCooldownMinutes);
+  s.verifyTimeoutSeconds = validNumber(s.verifyTimeoutSeconds, 5, DEFAULT_SMARTCHECK.verifyTimeoutSeconds);
+  s.interruptTimeoutSeconds = validNumber(s.interruptTimeoutSeconds, 5, DEFAULT_SMARTCHECK.interruptTimeoutSeconds);
+  s.commandSettleMs = clamp(s.commandSettleMs, 50, 5000, DEFAULT_SMARTCHECK.commandSettleMs);
+  s.assumeModelOnStart = s.assumeModelOnStart === 'fallback' || s.assumeModelOnStart === 'opus' ? 'fallback' : 'primary';
+  // Accept the fableUnavailablePatterns spelling from early docs as an alias.
+  const unavailRaw = s.primaryUnavailablePatterns ?? s.fableUnavailablePatterns;
+  s.primaryUnavailablePatterns = validPatterns(unavailRaw, DEFAULT_SMARTCHECK.primaryUnavailablePatterns);
+  delete s.fableUnavailablePatterns;
+  return s;
+}
+
 function validate(cfg) {
   cfg.maxRetries = validNumber(cfg.maxRetries, 1, DEFAULT_CONFIG.maxRetries);
   cfg.pollIntervalSeconds = validNumber(cfg.pollIntervalSeconds, 1, DEFAULT_CONFIG.pollIntervalSeconds);
@@ -164,6 +282,7 @@ function validate(cfg) {
   }
   cfg.overload = validateOverload(cfg.overload);
   cfg.safeguard = validateSafeguard(cfg.safeguard);
+  cfg.smartCheck = validateSmartCheck(cfg.smartCheck);
   return cfg;
 }
 

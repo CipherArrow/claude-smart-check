@@ -1,10 +1,11 @@
-import { stripAnsi, isRateLimited, findRateLimitMessage, isRateLimitOptionsPrompt, menuStepsToWaitOption, detectOverload, overloadMatch, detectSafeguard, safeguardMatch, isWorking } from './patterns.js';
+import { stripAnsi, isRateLimited, findRateLimitMessage, isRateLimitOptionsPrompt, menuStepsToWaitOption, detectOverload, overloadMatch, detectSafeguard, safeguardMatch, isWorking, downgradeMatch, confirmationCount, isInputEmpty, isPickerOpen, menuStepsToOption, liveTailText } from './patterns.js';
 import { parseResetTime, calculateWaitMs } from './time-parser.js';
-import { capturePane, sendKeys, sendKey, getPaneCommand, isProcessForeground } from './tmux.js';
+import { capturePane, sendKeys, sendKey, sendCommand, getPaneCommand, isProcessForeground } from './tmux.js';
 import { loadConfig } from './config.js';
 import { createLogger } from './logger.js';
 import { readStopFailureEvent, clearStopFailureEvent, isRetryableError } from './events.js';
 import { writeStatus, clearStatus, sweepStaleStatus } from './status-file.js';
+import { writeSmartState, readSmartState, clearSmartState, consumeSmartCommand, sweepStaleSmartState } from './smartcheck-state.js';
 
 const DEFAULT_FOREGROUND_COMMANDS = ['node', 'claude', 'npx', 'tsx', 'bun', 'deno'];
 const SHELL_COMMANDS = ['bash', 'zsh', 'sh', 'fish', 'dash', 'ksh'];
@@ -23,7 +24,102 @@ export function createMonitorState() {
     viaEvent: false,
     // Safeguard/AUP false-positive retry sub-state (bounded, seconds-scale).
     safeguardAttempts: 0, safeguardWaitUntil: 0,
+    // Smart-check model/effort recovery sub-state — see the smartcheck tick.
+    smart: createSmartState(),
   };
+}
+
+export function createSmartState() {
+  return {
+    // In-memory phase machinery (rebuilt from scratch on monitor restart; the durable
+    // fields below rehydrate it via smart.pendingFallback re-entry).
+    phase: null, phaseDeadline: 0, preSendCount: 0, effortCycles: 0,
+    escSends: 0, pickerTried: false, wasWorking: false,
+    forceBack: false, pendingRephrase: false, fingerprint: null,
+    // 'usage-retry' while the restore-before-continue detour is active: the usage-limit
+    // wait expired with the session on the fallback model, so the primary is restored
+    // FIRST and then control returns to the waiting branch to send the continue.
+    afterBack: null,
+    // Durable session fields, mirrored to the per-pane smartcheck state file so a
+    // reconcile-replaced monitor keeps the session's model facts.
+    currentModel: 'unknown',   // 'primary' | 'fallback' | 'below' | 'unknown'
+    pinned: false,             // `smart-check stay`: never auto-restore the primary
+    enabled: true,             // `smart-check on|off` (config smartCheck.enabled gates globally)
+    primaryUnavailable: false, // primary model unusable (credits) — stay on fallback
+    halted: false,             // switched below the fallback model — no automation at all
+    lastFlagAt: 0, cleanTurns: 0, lastHandledBanner: null, pendingFallback: false,
+  };
+}
+
+const SMART_DURABLE_FIELDS = ['currentModel', 'pinned', 'enabled', 'primaryUnavailable', 'halted', 'lastFlagAt', 'cleanTurns', 'lastHandledBanner', 'pendingFallback'];
+
+export function smartDurableFields(smart) {
+  const out = {};
+  for (const k of SMART_DURABLE_FIELDS) out[k] = smart[k];
+  return out;
+}
+
+export function adoptSmartState(smart, persisted) {
+  if (!persisted || typeof persisted !== 'object') return;
+  for (const k of SMART_DURABLE_FIELDS) {
+    if (persisted[k] !== undefined) smart[k] = persisted[k];
+  }
+}
+
+async function persistSmart(state, tmuxAdapter) {
+  if (!tmuxAdapter.saveSmartState) return;
+  try { await tmuxAdapter.saveSmartState(smartDurableFields(state.smart)); } catch { /* best-effort */ }
+}
+
+function safeTest(pattern, text) {
+  if (!pattern || !text) return false;
+  try { return new RegExp(pattern, 'i').test(text); } catch { return false; }
+}
+
+function setSmartPhase(smart, phase, deadlineMs, now = Date.now()) {
+  smart.phase = phase;
+  smart.phaseDeadline = deadlineMs > 0 ? now + deadlineMs : 0;
+  smart.pickerTried = false;
+}
+
+// Apply a CLI control marker. Returns a result token for logging, or null.
+export function applySmartCommand(state, cmd) {
+  const smart = state.smart;
+  const inBackPhase = state.status === 'smartcheck' && smart.phase && smart.phase.startsWith('back-');
+  switch (cmd) {
+    case 'stay':
+      smart.pinned = true;
+      smart.forceBack = false;
+      if (inBackPhase) abortBackToStatus(state);
+      return 'smartcheck-cmd-stay';
+    case 'resume':
+      smart.pinned = false;
+      smart.primaryUnavailable = false;
+      smart.halted = false;
+      smart.pendingRephrase = false;
+      if (smart.currentModel === 'below') smart.currentModel = 'unknown';
+      return 'smartcheck-cmd-resume';
+    case 'back':
+      if (smart.halted) return 'smartcheck-cmd-back-refused';
+      smart.primaryUnavailable = false;
+      smart.forceBack = true;
+      return 'smartcheck-cmd-back';
+    case 'rephrase':
+      if (!smart.halted) return 'smartcheck-cmd-rephrase-ignored';
+      smart.pendingRephrase = true;
+      return 'smartcheck-cmd-rephrase';
+    case 'on':
+      smart.enabled = true;
+      return 'smartcheck-cmd-on';
+    case 'off':
+      smart.enabled = false;
+      smart.forceBack = false;
+      smart.pendingRephrase = false;
+      if (state.status === 'smartcheck') abortBackToStatus(state);
+      return 'smartcheck-cmd-off';
+    default:
+      return null;
+  }
 }
 
 // --- Overload backoff schedule (pure, testable) ---
@@ -58,6 +154,113 @@ function resetSafeguard(state) {
   state.safeguardWaitUntil = 0;
   state._safeguardGaveUp = false;
   state._gaveUp = false;
+}
+
+// --- Smart-check entry/classification ---
+
+// A downgrade banner names the model the harness switched TO; the configured fallback
+// model gets the promote-effort treatment, anything else (or an unreadable name — fail
+// safe) halts automation for a human decision.
+function classifyDowngrade(m, sc) {
+  if (m.switchedTo && safeTest(sc.models.fallback.name, m.switchedTo)) return 'fallback';
+  return 'below';
+}
+
+function beginSmartFallback(state, m, working, sc, now = Date.now()) {
+  const smart = state.smart;
+  smart.afterBack = null;   // a fresh flag owns the pane; any pending resume detour is void
+  smart.lastFlagAt = now;
+  smart.cleanTurns = 0;
+  smart.pendingFallback = true;
+  smart.fingerprint = m ? m.fingerprint : `resumed-${now}`;
+  smart.escSends = 0;
+  smart.effortCycles = 0;
+  state.status = 'smartcheck';
+  setSmartPhase(smart, working ? 'interrupt' : 'set-model', sc.interruptTimeoutSeconds * 1000, now);
+  return working ? 'smartcheck-downgrade-detected' : 'smartcheck-downgrade-detected-idle';
+}
+
+function beginSmartHalt(state, m, now = Date.now()) {
+  const smart = state.smart;
+  smart.afterBack = null;
+  smart.halted = true;
+  smart.currentModel = 'below';
+  smart.lastFlagAt = now;
+  smart.lastHandledBanner = m.fingerprint;
+  smart.pendingFallback = false;
+  smart.phase = null;
+  state.status = 'monitoring';
+  state._smartHaltBanner = m.line;
+  return 'smartcheck-halted';
+}
+
+// Shared by the monitoring branch and the safeguard/back-phase handoffs.
+function handleSmartDowngrade(state, m, sc, working, now = Date.now()) {
+  if (classifyDowngrade(m, sc) === 'fallback') return beginSmartFallback(state, m, working, sc, now);
+  if (sc.haltBelowFallback) return beginSmartHalt(state, m, now);
+  // Halt disabled by config: acknowledge the banner, do nothing.
+  state.smart.lastHandledBanner = m.fingerprint;
+  return 'smartcheck-downgrade-ignored';
+}
+
+// Give up on the current phase sequence: mark the banner handled (so the persistent
+// render can't re-trigger next tick), log loudly, resume plain monitoring.
+function smartGiveUp(state, reason) {
+  const smart = state.smart;
+  smart.lastHandledBanner = smart.fingerprint || smart.lastHandledBanner;
+  smart.pendingFallback = false;
+  smart.phase = null;
+  state.status = 'monitoring';
+  state._smartGiveUpReason = reason;
+  return 'smartcheck-gave-up';
+}
+
+// The nudge is done (or skipped): the pane is on the fallback model at the fallback
+// effort; start counting clean turns toward the switch-back.
+function completeSmartFallback(state, result) {
+  const smart = state.smart;
+  smart.currentModel = 'fallback';
+  smart.lastHandledBanner = smart.fingerprint || smart.lastHandledBanner;
+  smart.pendingFallback = false;
+  smart.cleanTurns = 0;
+  smart.wasWorking = false;
+  smart.phase = null;
+  state.status = 'monitoring';
+  return result;
+}
+
+function completeSmartBack(state) {
+  const smart = state.smart;
+  smart.currentModel = 'primary';
+  smart.cleanTurns = 0;
+  smart.pendingFallback = false;
+  smart.phase = null;
+  if (smart.afterBack === 'usage-retry') {
+    // Restore-before-continue detour: hand control straight back to the waiting branch
+    // so the very next tick sends the usage retry — now on the primary model + effort.
+    smart.afterBack = null;
+    state.status = 'waiting';
+    state.waitUntil = Date.now();
+    return 'smartcheck-back-complete-resume';
+  }
+  state.status = 'monitoring';
+  return 'smartcheck-back-complete';
+}
+
+// A back-phase failure/abort while the usage-retry detour is active must NOT strand the
+// pane: the continue still has to go out, just on the fallback model. Reroute to the
+// waiting branch for an immediate retry instead of plain monitoring.
+function abortBackToStatus(state) {
+  const smart = state.smart;
+  smart.phase = null;
+  if (smart.afterBack === 'usage-retry') {
+    smart.afterBack = null;
+    state.status = 'waiting';
+    state.waitUntil = Date.now();
+    return true;
+  }
+  state.status = 'monitoring';
+  return false;
 }
 
 // Foreground safety: is claude/node the foreground process (safe to send-keys), or did
@@ -100,6 +303,250 @@ function enterOverload(state, overload, rand) {
   return 'overload-detected';
 }
 
+// --- Smart-check phase tick (state.status === 'smartcheck') ---
+// Verified, sequential recovery: every send is confirmed from the pane render before the
+// next one fires, every phase has a deadline, and every failure path is a loud no-op
+// (give up / abort / pin) rather than blind keystrokes.
+async function smartcheckTick(state, tmuxAdapter, pane, config, stripped) {
+  const sc = config.smartCheck;
+  const smart = state.smart;
+  const now = Date.now();
+  const working = isWorking(stripped);
+  const isBack = !!(smart.phase && smart.phase.startsWith('back-'));
+
+  // Usage limit takes precedence: hand off to the hours-scale wait. pendingFallback
+  // survives, so the promote sequence re-enters once monitoring resumes. EXCEPT during
+  // the restore-before-continue detour — there the limit banner is exactly why we're
+  // here (the wait just expired), and re-entering the wait would recompute a stale
+  // reset time and strand the pane.
+  if (!smart.afterBack && isRateLimited(stripped, config.customPatterns, RATE_LIMIT_TAIL_LINES)) {
+    smart.phase = null;
+    return enterUsageWait(state, stripped, config);
+  }
+
+  // A fresh flag banner while switching back: the new flag owns the pane — reclassify
+  // (typically: back onto the fallback path, or a below-fallback halt).
+  if (isBack) {
+    const m = downgradeMatch(stripped, sc.downgradePatterns, sc.downgradeAnchors);
+    if (m && m.fingerprint !== smart.lastHandledBanner) {
+      const res = handleSmartDowngrade(state, m, sc, working, now);
+      await persistSmart(state, tmuxAdapter);
+      return res;
+    }
+  }
+
+  switch (smart.phase) {
+    case 'interrupt': {
+      // The flagged turn is still streaming on the substitute model at the WRONG effort —
+      // stop it before switching. Escape is only ever sent while the working footer is
+      // visible (a single Escape at an idle prompt is harmless, but a second one opens
+      // the history-rewind UI — so never send into an idle pane).
+      if (!working) { setSmartPhase(smart, 'set-model', sc.interruptTimeoutSeconds * 1000, now); return 'smartcheck-interrupted'; }
+      if (smart.phaseDeadline && now > smart.phaseDeadline) {
+        const r = smartGiveUp(state, 'interrupt-timeout');
+        await persistSmart(state, tmuxAdapter);
+        return r;
+      }
+      const fg = await checkForeground(tmuxAdapter, pane, config);
+      if (!fg.ok) { state._lastForeground = fg.fg; return 'skipped-not-claude'; }
+      if (smart.escSends < 3) {
+        smart.escSends++;
+        await tmuxAdapter.sendKey(pane, 'Escape');
+        return 'smartcheck-escape-sent';
+      }
+      return 'smartcheck-interrupt-waiting';
+    }
+
+    case 'set-model':
+    case 'back-model': {
+      if (working) {
+        // Switch-back: the pane is active again (the user, or a resumed turn) — step
+        // aside quietly; a detour's continue is unnecessary if work already resumed.
+        // Fallback: the flagged turn is running again on the wrong effort — go stop it.
+        if (isBack) { smart.afterBack = null; smart.phase = null; state.status = 'monitoring'; return 'smartcheck-back-aborted'; }
+        smart.escSends = 0;
+        setSmartPhase(smart, 'interrupt', sc.interruptTimeoutSeconds * 1000, now);
+        return 'smartcheck-reinterrupt';
+      }
+      if (!isInputEmpty(stripped)) {
+        if (smart.phaseDeadline && now > smart.phaseDeadline) {
+          if (isBack) { smart.afterBack = null; smart.phase = null; state.status = 'monitoring'; return 'smartcheck-back-aborted'; }
+          const r = smartGiveUp(state, 'input-not-empty');
+          await persistSmart(state, tmuxAdapter);
+          return r;
+        }
+        return 'smartcheck-waiting-input';
+      }
+      const fg = await checkForeground(tmuxAdapter, pane, config);
+      if (!fg.ok) { state._lastForeground = fg.fg; return 'skipped-not-claude'; }
+      const spec = isBack ? sc.models.primary : sc.models.fallback;
+      smart.preSendCount = confirmationCount(stripped, spec.confirm);
+      await tmuxAdapter.sendCommand(pane, spec.command, sc.commandSettleMs);
+      setSmartPhase(smart, isBack ? 'back-verify-model' : 'verify-model', sc.verifyTimeoutSeconds * 1000, now);
+      return isBack ? 'smartcheck-back-model-sent' : 'smartcheck-model-sent';
+    }
+
+    case 'verify-model':
+    case 'back-verify-model': {
+      const spec = isBack ? sc.models.primary : sc.models.fallback;
+      if (confirmationCount(stripped, spec.confirm) > smart.preSendCount) {
+        setSmartPhase(smart, isBack ? 'back-effort' : 'set-effort', sc.interruptTimeoutSeconds * 1000, now);
+        return isBack ? 'smartcheck-back-model-verified' : 'smartcheck-model-verified';
+      }
+      // Switch-back only: an explicit "primary unusable" render (credits exhausted,
+      // model unavailable) pins the session to the fallback immediately. During the
+      // restore-before-continue detour the pending usage retry still goes out — on the
+      // fallback model (never a lockout).
+      if (isBack && sc.primaryUnavailablePatterns.some((p) => safeTest(p, liveTailText(stripped)))) {
+        smart.primaryUnavailable = true;
+        smart.forceBack = false;
+        abortBackToStatus(state);
+        await persistSmart(state, tmuxAdapter);
+        return 'smartcheck-primary-unavailable';
+      }
+      if (working) {
+        if (isBack) { smart.afterBack = null; smart.phase = null; state.status = 'monitoring'; return 'smartcheck-back-aborted'; }
+        smart.phaseDeadline = now + sc.verifyTimeoutSeconds * 1000;
+        return 'smartcheck-waiting-idle';
+      }
+      if (now <= smart.phaseDeadline) return 'smartcheck-verifying';
+      // Deadline passed with no confirmation. Maybe the command opened its picker.
+      if (isPickerOpen(stripped) && !smart.pickerTried) {
+        const steps = menuStepsToOption(stripped, spec.pickerOption);
+        if (steps !== null) {
+          const fgp = await checkForeground(tmuxAdapter, pane, config);
+          if (!fgp.ok) { state._lastForeground = fgp.fg; return 'skipped-not-claude'; }
+          const key = steps >= 0 ? 'Down' : 'Up';
+          for (let i = 0; i < Math.abs(steps); i++) {
+            await tmuxAdapter.sendKey(pane, key);
+            await new Promise((r) => setTimeout(r, 80));
+          }
+          await tmuxAdapter.sendKey(pane, 'Enter');
+          smart.pickerTried = true;
+          smart.phaseDeadline = now + sc.verifyTimeoutSeconds * 1000;
+          return 'smartcheck-picker-driven';
+        }
+        // Unreadable picker layout: close the modal rather than leave it up, then fail.
+        await tmuxAdapter.sendKey(pane, 'Escape');
+      }
+      if (isBack) {
+        smart.primaryUnavailable = true;
+        smart.forceBack = false;
+        abortBackToStatus(state);
+        await persistSmart(state, tmuxAdapter);
+        return 'smartcheck-primary-unavailable';
+      }
+      const r = smartGiveUp(state, 'model-verify-timeout');
+      await persistSmart(state, tmuxAdapter);
+      return r;
+    }
+
+    case 'set-effort':
+    case 'back-effort': {
+      if (working) {
+        // Effort changes are quick; a working pane here means the user (or the model
+        // switch's own render churn) got a turn going — wait it out, don't interrupt.
+        smart.phaseDeadline = now + sc.interruptTimeoutSeconds * 1000;
+        return 'smartcheck-waiting-idle';
+      }
+      if (!isInputEmpty(stripped)) {
+        if (smart.phaseDeadline && now > smart.phaseDeadline) {
+          if (isBack) { const res = completeSmartBack(state); await persistSmart(state, tmuxAdapter); return res; }
+          setSmartPhase(smart, 'nudge', sc.interruptTimeoutSeconds * 1000, now);
+          return 'smartcheck-effort-skipped';
+        }
+        return 'smartcheck-waiting-input';
+      }
+      const fg = await checkForeground(tmuxAdapter, pane, config);
+      if (!fg.ok) { state._lastForeground = fg.fg; return 'skipped-not-claude'; }
+      const spec = isBack ? sc.effort.primary : sc.effort.fallback;
+      smart.preSendCount = confirmationCount(stripped, spec.confirm);
+      await tmuxAdapter.sendCommand(pane, spec.command, sc.commandSettleMs);
+      setSmartPhase(smart, isBack ? 'back-verify-effort' : 'verify-effort', sc.verifyTimeoutSeconds * 1000, now);
+      return isBack ? 'smartcheck-back-effort-sent' : 'smartcheck-effort-sent';
+    }
+
+    case 'verify-effort':
+    case 'back-verify-effort': {
+      const spec = isBack ? sc.effort.primary : sc.effort.fallback;
+      if (confirmationCount(stripped, spec.confirm) > smart.preSendCount) {
+        if (isBack) { const res = completeSmartBack(state); await persistSmart(state, tmuxAdapter); return res; }
+        setSmartPhase(smart, 'nudge', sc.interruptTimeoutSeconds * 1000, now);
+        return 'smartcheck-effort-verified';
+      }
+      if (working) {
+        smart.phaseDeadline = now + sc.verifyTimeoutSeconds * 1000;
+        return 'smartcheck-waiting-idle';
+      }
+      if (now <= smart.phaseDeadline) return 'smartcheck-verifying';
+      // Maybe /effort opened a selector — drive it to the target option.
+      if (isPickerOpen(stripped) && !smart.pickerTried) {
+        const steps = menuStepsToOption(stripped, spec.pickerOption);
+        if (steps !== null) {
+          const fgp = await checkForeground(tmuxAdapter, pane, config);
+          if (!fgp.ok) { state._lastForeground = fgp.fg; return 'skipped-not-claude'; }
+          const key = steps >= 0 ? 'Down' : 'Up';
+          for (let i = 0; i < Math.abs(steps); i++) {
+            await tmuxAdapter.sendKey(pane, key);
+            await new Promise((r) => setTimeout(r, 80));
+          }
+          await tmuxAdapter.sendKey(pane, 'Enter');
+          smart.pickerTried = true;
+          smart.phaseDeadline = now + sc.verifyTimeoutSeconds * 1000;
+          return 'smartcheck-picker-driven';
+        }
+        await tmuxAdapter.sendKey(pane, 'Escape');
+      }
+      // Maybe `/effort <level>` ignores its argument and bare /effort cycles levels:
+      // keep cycling (bounded to a full wrap) until the target confirmation appears.
+      if (smart.effortCycles < sc.effort.maxCycles) {
+        const fgc = await checkForeground(tmuxAdapter, pane, config);
+        if (!fgc.ok) { state._lastForeground = fgc.fg; return 'skipped-not-claude'; }
+        smart.effortCycles++;
+        smart.pickerTried = false;
+        await tmuxAdapter.sendCommand(pane, '/effort', sc.commandSettleMs);
+        smart.phaseDeadline = now + 10_000;
+        return 'smartcheck-effort-cycled';
+      }
+      // Effort couldn't be verified — the model switch (the important half) stands, so
+      // proceed with a loud warning instead of blocking recovery on the effort level.
+      if (isBack) { completeSmartBack(state); await persistSmart(state, tmuxAdapter); return 'smartcheck-back-effort-mismatch'; }
+      setSmartPhase(smart, 'nudge', sc.interruptTimeoutSeconds * 1000, now);
+      return 'smartcheck-effort-mismatch';
+    }
+
+    case 'nudge': {
+      // Model + effort are set. Resume the flagged work — unless something already did.
+      if (working) {
+        const res = completeSmartFallback(state, 'smartcheck-fallback-complete-nonudge');
+        await persistSmart(state, tmuxAdapter);
+        return res;
+      }
+      if (!isInputEmpty(stripped)) {
+        if (smart.phaseDeadline && now > smart.phaseDeadline) {
+          const res = completeSmartFallback(state, 'smartcheck-fallback-complete-nonudge');
+          await persistSmart(state, tmuxAdapter);
+          return res;
+        }
+        return 'smartcheck-waiting-input';
+      }
+      const fg = await checkForeground(tmuxAdapter, pane, config);
+      if (!fg.ok) { state._lastForeground = fg.fg; return 'skipped-not-claude'; }
+      await tmuxAdapter.sendKeys(pane, sc.nudgeMessage);
+      const res = completeSmartFallback(state, 'smartcheck-fallback-complete');
+      await persistSmart(state, tmuxAdapter);
+      return res;
+    }
+
+    default: {
+      // Unknown/cleared phase — never wedge the monitor in the smartcheck status.
+      smart.phase = null;
+      state.status = 'monitoring';
+      return 'monitoring';
+    }
+  }
+}
+
 export async function processOneTick(state, tmuxAdapter, pane, config, isAlive, rand = Math.random) {
   if (!isAlive()) return 'exit';
 
@@ -111,6 +558,35 @@ export async function processOneTick(state, tmuxAdapter, pane, config, isAlive, 
   const raw = await tmuxAdapter.capturePane(pane, 120);
   const stripped = stripAnsi(raw);
   const overload = config.overload;
+  const sc = config.smartCheck;
+
+  // Smart-check CLI control markers (stay/resume/back/rephrase/on/off) apply in ANY
+  // status — they only mutate smart-check's own fields (and can abort its phases), so
+  // consuming them here can't disturb the other branches. Logged via _smartCmdApplied.
+  state._smartCmdApplied = null;
+  if (sc && sc.enabled && tmuxAdapter.readSmartCommand) {
+    const cmd = await tmuxAdapter.readSmartCommand();
+    if (cmd) {
+      state._smartCmdApplied = applySmartCommand(state, cmd);
+      await persistSmart(state, tmuxAdapter);
+    }
+  }
+
+  // Below-fallback halt: EVERYTHING stops — no retries, no menu driving, no nudges —
+  // until `smart-check resume` (automation back on, model unknown) or `smart-check
+  // rephrase` (queued below). The user decides; the monitor only watches.
+  if (sc && sc.enabled && state.smart.enabled && state.smart.halted) {
+    if (state.smart.pendingRephrase && !isWorking(stripped) && isInputEmpty(stripped)) {
+      const fg = await checkForeground(tmuxAdapter, pane, config);
+      if (!fg.ok) { state._lastForeground = fg.fg; return 'skipped-not-claude'; }
+      await tmuxAdapter.sendKeys(pane, sc.rephraseMessage);
+      state.smart.pendingRephrase = false;
+      state.smart.halted = false;   // automation resumes; model stays 'below' until reclassified
+      await persistSmart(state, tmuxAdapter);
+      return 'smartcheck-rephrased';
+    }
+    return 'smartcheck-halted-idle';
+  }
 
   // Handle the interactive /rate-limit-options menu before any other logic. A bare
   // Enter here confirms the highlighted default, which on some Claude Code versions
@@ -181,6 +657,26 @@ export async function processOneTick(state, tmuxAdapter, pane, config, isAlive, 
       state.waitUntil = Date.now() + (config.pollIntervalSeconds * 1000 * 12);
       state._gaveUp = true;
       return 'max-retries';
+    }
+
+    // Restore-before-continue: the wait expired with the session still on the fallback
+    // model — put the primary model + effort back FIRST (verified, via the smartcheck
+    // back phases) so the "continue" resumes in the pre-limit state. cleanTurns is
+    // deliberately waived here (no turns can complete during an hours-scale wait); the
+    // flag cooldown still applies. /model and /effort are handled locally by Claude
+    // Code, so they work fine while the API is still limited. If the primary turns out
+    // to be unavailable, the detour pins the fallback and the retry goes out anyway.
+    {
+      const scw = config.smartCheck;
+      const sw = state.smart;
+      if (scw && scw.enabled && sw.enabled && sw.currentModel === 'fallback'
+          && !sw.pinned && !sw.primaryUnavailable && !sw.halted && !sw.afterBack
+          && Date.now() - sw.lastFlagAt >= scw.switchBackCooldownMinutes * 60_000) {
+        sw.afterBack = 'usage-retry';
+        state.status = 'smartcheck';
+        setSmartPhase(sw, 'back-model', scw.interruptTimeoutSeconds * 1000);
+        return 'smartcheck-back-before-retry';
+      }
     }
 
     // Primary check: is the Claude process in the foreground process group?
@@ -318,6 +814,19 @@ export async function processOneTick(state, tmuxAdapter, pane, config, isAlive, 
     if (!isAlive()) return 'exit';
     const safeguard = config.safeguard;
 
+    // Handoff: if the flag render turns out to be (or becomes) the model-switch banner,
+    // smart-check owns it — re-sending "continue" here would submit the flagged turn on
+    // the downgraded model at the wrong effort. Mirrors the monitoring-branch gate.
+    if (sc && sc.enabled && state.smart.enabled && !state.smart.halted) {
+      const dg = downgradeMatch(stripped, sc.downgradePatterns, sc.downgradeAnchors);
+      if (dg && dg.fingerprint !== state.smart.lastHandledBanner) {
+        resetSafeguard(state);
+        const res = handleSmartDowngrade(state, dg, sc, isWorking(stripped));
+        await persistSmart(state, tmuxAdapter);
+        return res;
+      }
+    }
+
     // A usage limit or Claude resuming takes precedence / means recovery.
     if (isRateLimited(stripped, config.customPatterns, RATE_LIMIT_TAIL_LINES)) {
       resetSafeguard(state); return enterUsageWait(state, stripped, config);
@@ -364,6 +873,10 @@ export async function processOneTick(state, tmuxAdapter, pane, config, isAlive, 
     return 'safeguard-retried';
   }
 
+  if (state.status === 'smartcheck') {
+    return smartcheckTick(state, tmuxAdapter, pane, config, stripped);
+  }
+
   // --- monitoring ---
   // Usage-limit (hours-scale reset) takes precedence over overload (seconds-scale). No
   // !isWorking gate here: it would widen every WORKING_PATTERN from "skip one injection" to
@@ -376,6 +889,58 @@ export async function processOneTick(state, tmuxAdapter, pane, config, isAlive, 
   if (isRateLimited(stripped, config.customPatterns, RATE_LIMIT_TAIL_LINES)) {
     return enterUsageWait(state, stripped, config);
   }
+
+  // --- Smart-check detection & bookkeeping (see smartcheckTick for the phases) ---
+  const smart = state.smart;
+  const workingNow = isWorking(stripped);
+  const smartBanner = sc && sc.enabled
+    ? downgradeMatch(stripped, sc.downgradePatterns, sc.downgradeAnchors)
+    : null;
+  const smartActive = sc && sc.enabled && smart.enabled;
+  if (smartActive) {
+    // Banner left the live tail → a future identical render is a fresh incident
+    // (mirrors _eventHandledBanner).
+    if (!smartBanner && smart.lastHandledBanner) {
+      smart.lastHandledBanner = null;
+      await persistSmart(state, tmuxAdapter);
+    }
+
+    // A fresh downgrade banner: classify (fallback promote vs below-fallback halt).
+    // Deliberately NOT isWorking-gated — the banner lands exactly when the substitute
+    // model may still be streaming; working just selects the interrupt entry phase.
+    if (smartBanner && smartBanner.fingerprint !== smart.lastHandledBanner) {
+      const res = handleSmartDowngrade(state, smartBanner, sc, workingNow);
+      await persistSmart(state, tmuxAdapter);
+      return res;
+    }
+
+    // Clean-turn bookkeeping: a working→idle edge with no live banner at the idle tick.
+    if (smart.currentModel === 'fallback' && smart.wasWorking && !workingNow && !smartBanner) {
+      smart.cleanTurns++;
+      await persistSmart(state, tmuxAdapter);
+    }
+
+    // Monitor restarted (reconcile replacement) or got diverted mid-fallback: resume
+    // the promote sequence — every step is idempotent.
+    if (smart.pendingFallback) {
+      smart.wasWorking = workingNow;
+      beginSmartFallback(state, smartBanner, workingNow, sc);
+      await persistSmart(state, tmuxAdapter);
+      return 'smartcheck-resumed-fallback';
+    }
+
+    // Deferred primary failure: nominally back on the primary model but the pane shows a
+    // primary-unusable render (credits ran out after a verified switch). Pin + re-promote
+    // so the session stays usable on the fallback.
+    if (smart.currentModel === 'primary' && !workingNow
+        && sc.primaryUnavailablePatterns.some((p) => safeTest(p, liveTailText(stripped)))) {
+      smart.primaryUnavailable = true;
+      beginSmartFallback(state, null, false, sc);
+      await persistSmart(state, tmuxAdapter);
+      return 'smartcheck-primary-unavailable';
+    }
+  }
+  smart.wasWorking = workingNow;
 
   // Event-driven overload (authoritative and faster; see DESIGN-NOTES §1). A StopFailure
   // marker for this pane means the turn ended in a retryable API error — no scraping, no
@@ -431,8 +996,11 @@ export async function processOneTick(state, tmuxAdapter, pane, config, isAlive, 
 
   // Safeguard/AUP false-positive: enter a bounded, seconds-scale retry loop. Independent
   // of the overload path (different render, different recovery). Only when Claude is idle.
+  // Suppressed whenever the downgrade banner is in the tail (even an already-handled one):
+  // a combined render must belong to smart-check — re-sending "continue" here would submit
+  // the flagged turn on the downgraded model.
   const safeguard = config.safeguard;
-  if (safeguard && safeguard.enabled && !isWorking(stripped)) {
+  if (safeguard && safeguard.enabled && !workingNow && !smartBanner) {
     const match = safeguardMatch(stripped, safeguard.patterns);
     if (match) {
       resetSafeguard(state);
@@ -440,6 +1008,26 @@ export async function processOneTick(state, tmuxAdapter, pane, config, isAlive, 
       state.safeguardWaitUntil = Date.now() + (safeguard.retryDelaySeconds * 1000);
       state._safeguardMatch = match;
       return 'safeguard-detected';
+    }
+  }
+
+  // Smart-check switch-back: quiet period satisfied (or `smart-check back` forced it),
+  // pane idle with an empty prompt, nothing pinning us to the fallback → restore the
+  // primary model + effort. Runs LAST so every live-error path above takes precedence.
+  if (smartActive && !smart.pinned && !smart.primaryUnavailable && !workingNow
+      && (smart.currentModel === 'fallback' || smart.forceBack)) {
+    const quietOk = smart.currentModel === 'fallback'
+      && smart.cleanTurns >= sc.cleanTurnsBeforeSwitchBack
+      && (Date.now() - smart.lastFlagAt) >= sc.switchBackCooldownMinutes * 60_000;
+    if ((smart.forceBack || quietOk) && isInputEmpty(stripped)) {
+      const fg = await checkForeground(tmuxAdapter, pane, config);
+      if (fg.ok) {
+        smart.forceBack = false;
+        state.status = 'smartcheck';
+        setSmartPhase(smart, 'back-model', sc.interruptTimeoutSeconds * 1000);
+        return 'smartcheck-back-started';
+      }
+      state._lastForeground = fg.fg;
     }
   }
 
@@ -458,6 +1046,18 @@ export async function startMonitor(pane, pid) {
   // Best-effort GC of status files left behind by monitors that died without cleaning up
   // (SIGKILL, host sleep/crash). Runs once per monitor start, not per tick.
   sweepStaleStatus().catch(() => {});
+  sweepStaleSmartState().catch(() => {});
+
+  // Rehydrate smart-check's durable session fields (PID-validated: a recycled pane id
+  // with a NEW claude starts fresh). A monitor replaced mid-fallback resumes the promote
+  // sequence via pendingFallback in the monitoring branch.
+  const persistedSmart = await readSmartState(pane, pid).catch(() => null);
+  if (persistedSmart) {
+    adoptSmartState(state.smart, persistedSmart);
+    await logger.info(`Smart-check state rehydrated: model=${state.smart.currentModel}${state.smart.halted ? ' HALTED' : ''}${state.smart.pinned ? ' pinned' : ''}${state.smart.primaryUnavailable ? ' primary-unavailable' : ''}${state.smart.pendingFallback ? ' pending-fallback' : ''}`);
+  } else if (config.smartCheck?.enabled) {
+    state.smart.currentModel = config.smartCheck.assumeModelOnStart === 'fallback' ? 'fallback' : 'primary';
+  }
 
   let shuttingDown = false;
   const shutdown = (signal) => {
@@ -475,12 +1075,17 @@ export async function startMonitor(pane, pid) {
 
   const eventMaxAgeMs = (config.overload?.eventMaxAgeSeconds || 120) * 1000;
   const tmuxAdapter = {
-    capturePane, sendKeys, sendKey, getPaneCommand,
+    capturePane, sendKeys, sendKey, sendCommand, getPaneCommand,
     isClaudeForeground: () => isProcessForeground(pid),
     // Pane-keyed StopFailure markers (written by the hook). The daemon owns the pane,
     // so this is a direct read — no session-id resolution needed.
     readEvent: () => readStopFailureEvent(pane, eventMaxAgeMs),
     clearEvent: () => clearStopFailureEvent(pane),
+    // Smart-check durable state + CLI control channel. State is kept on monitor
+    // SIGTERM (reconcile replacement must not wipe session facts) and cleared only
+    // when claude itself exits.
+    saveSmartState: (fields) => writeSmartState(pane, pid, fields),
+    readSmartCommand: () => consumeSmartCommand(pane),
   };
   const isAlive = () => { try { process.kill(pid, 0); return true; } catch { return false; } };
 
@@ -491,6 +1096,7 @@ export async function startMonitor(pane, pid) {
 
       if (result === 'exit') {
         await clearStatus(pane).catch(() => {});
+        await clearSmartState(pane).catch(() => {});
         await logger.info('Claude exited. Monitor shutting down.');
         process.exit(0);
       }
@@ -512,7 +1118,17 @@ export async function startMonitor(pane, pid) {
         safeguardAttempts: state.safeguardAttempts,
         pollIntervalSeconds: config.pollIntervalSeconds,
         gaveUp: !!state._gaveUp,
+        // Flat, grep-friendly smart-check keys for the tmux status segment + CLI status.
+        smartModel: state.smart.currentModel,
+        smartPhase: state.smart.phase || '',
+        smartPinned: !!(state.smart.pinned || state.smart.primaryUnavailable),
+        smartHalted: !!state.smart.halted,
+        smartCleanTurns: state.smart.cleanTurns,
       }).catch(() => {});
+      if (state._smartCmdApplied) {
+        await logger.info(`Smart-check command applied: ${state._smartCmdApplied}`);
+        state._smartCmdApplied = null;
+      }
       if (result === 'waiting' && state.lastRateLimitMessage) {
         const secs = Math.round((state.waitUntil - Date.now()) / 1000);
         await logger.info(`Rate limit detected: "${state.lastRateLimitMessage}". Waiting ${secs}s...`);
@@ -551,6 +1167,34 @@ export async function startMonitor(pane, pid) {
       if (result === 'safeguard-retried') await logger.info(`Safeguard retry sent (attempt ${state.safeguardAttempts}/${config.safeguard.maxRetries}).`);
       if (result === 'safeguard-cleared') await logger.info('Safeguard flag cleared. Resuming normal monitoring.');
       if (result === 'safeguard-gave-up') await logger.warn(`Safeguard flag persisted after ${config.safeguard.maxRetries} retries. Giving up — the flag is likely sticky for this content/model; try /model to switch models or rephrase. Will not retry until it clears.`);
+      // Smart-check results — one line per state change, quiet on the wait/verify ticks.
+      if (result === 'smartcheck-downgrade-detected' || result === 'smartcheck-downgrade-detected-idle') {
+        await logger.warn(`Smart-check: safeguard downgrade banner detected (switched to "${state.smart.fingerprint?.split('|').pop() || 'fallback model'}"). Promoting to ${config.smartCheck.models.fallback.command} + ${config.smartCheck.effort.fallback.command}${result.endsWith('idle') ? '' : ' (interrupting the in-flight turn first)'}.`);
+      }
+      if (result === 'smartcheck-halted') await logger.warn(`Smart-check: HALTED — flag switched the session BELOW the fallback model ("${state._smartHaltBanner || 'unreadable banner'}"). No automation will run. Decide with: claude smart-check resume | rephrase (or edit the prompt yourself).`);
+      if (result === 'smartcheck-escape-sent') await logger.info('Smart-check: sent Escape to stop the downgraded in-flight turn.');
+      if (result === 'smartcheck-model-sent') await logger.info(`Smart-check: sent "${config.smartCheck.models.fallback.command}"; verifying...`);
+      if (result === 'smartcheck-model-verified') await logger.info('Smart-check: fallback model confirmed. Setting effort...');
+      if (result === 'smartcheck-effort-sent') await logger.info(`Smart-check: sent "${config.smartCheck.effort.fallback.command}"; verifying...`);
+      if (result === 'smartcheck-effort-cycled') await logger.info(`Smart-check: /effort argument unverified — cycling bare /effort (${state.smart.effortCycles}/${config.smartCheck.effort.maxCycles}).`);
+      if (result === 'smartcheck-effort-mismatch') await logger.warn('Smart-check: could not verify the target effort level — proceeding anyway (model switch stands). Check /effort manually.');
+      if (result === 'smartcheck-effort-skipped') await logger.warn('Smart-check: input box stayed non-empty — skipped the effort change. Check /effort manually.');
+      if (result === 'smartcheck-picker-driven') await logger.info('Smart-check: command opened a picker; drove the selection with arrow keys.');
+      if (result === 'smartcheck-fallback-complete') await logger.info('Smart-check: fallback complete (model + effort verified, nudge sent). Counting clean turns toward switch-back.');
+      if (result === 'smartcheck-fallback-complete-nonudge') await logger.info('Smart-check: fallback complete (session already active — nudge skipped).');
+      if (result === 'smartcheck-resumed-fallback') await logger.info('Smart-check: resuming an interrupted fallback sequence (monitor restart or diversion).');
+      if (result === 'smartcheck-back-started') await logger.info(`Smart-check: quiet period satisfied — restoring ${config.smartCheck.models.primary.command} + ${config.smartCheck.effort.primary.command}.`);
+      if (result === 'smartcheck-back-model-sent') await logger.info(`Smart-check: sent "${config.smartCheck.models.primary.command}"; verifying...`);
+      if (result === 'smartcheck-back-model-verified') await logger.info('Smart-check: primary model confirmed. Restoring effort...');
+      if (result === 'smartcheck-back-complete') await logger.info('Smart-check: switch-back complete — session restored to the primary model + effort.');
+      if (result === 'smartcheck-back-before-retry') await logger.info('Smart-check: usage-limit wait expired on the fallback model — restoring the primary model + effort BEFORE sending the continue.');
+      if (result === 'smartcheck-back-complete-resume') await logger.info('Smart-check: primary model + effort restored; handing back to the usage path to send the continue.');
+      if (result === 'smartcheck-back-effort-mismatch') await logger.warn('Smart-check: primary model restored but the effort level could not be verified. Check /effort manually.');
+      if (result === 'smartcheck-back-aborted') await logger.info('Smart-check: switch-back stepped aside (session active again). Will retry at the next idle window.');
+      if (result === 'smartcheck-primary-unavailable') await logger.warn('Smart-check: primary model UNAVAILABLE (credits exhausted or model unusable). Pinned to the fallback model — the session stays fully usable. Re-enable restore attempts with: claude smart-check resume');
+      if (result === 'smartcheck-gave-up') await logger.warn(`Smart-check: gave up (${state._smartGiveUpReason || 'unknown'}). No further keystrokes for this banner; fix manually (/model, /effort) if needed.`);
+      if (result === 'smartcheck-rephrased') await logger.warn('Smart-check: sent the rephrase request. Automation re-enabled; model treated as unknown until the next verified switch.');
+      if (result === 'smartcheck-downgrade-ignored') await logger.warn('Smart-check: downgrade to a non-fallback model observed but haltBelowFallback is off — acknowledged without action.');
     } catch (err) {
       consecutiveErrors++;
       await logger.error(`Monitor tick error: ${err.message}`).catch(() => {});

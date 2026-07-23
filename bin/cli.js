@@ -7,8 +7,11 @@ import { homedir } from 'node:os';
 import { execFileSync, spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { writeStopFailureEvent, isRetryableError } from '../src/events.js';
-import { sweepStaleStatus } from '../src/status-file.js';
+import { sweepStaleStatus, readStatus } from '../src/status-file.js';
 import { reconcile, excludeSelf, parseRunningMonitors, PGREP_LIST_FLAG } from '../src/reconcile.js';
+import { writeSmartCommand, writeSmartCommandForKey, listSmartStates, SMARTCHECK_COMMANDS } from '../src/smartcheck-state.js';
+import { sanitizeKey } from '../src/pane-key.js';
+import { STATUS_DIR } from '../src/status-file.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -452,6 +455,87 @@ async function cmdReconcile() {
   if (armed.length === 0) console.log('All live claude sessions already monitored.');
 }
 
+// --- smart-check: model/effort recovery control ---
+// `claude smart-check <sub>` (routed here by the launcher). The monitor consumes the
+// command marker on its next tick (~pollIntervalSeconds).
+
+const SMARTCHECK_HELP = `claude smart-check — safeguard-downgrade model/effort recovery
+
+Usage: claude smart-check [status|back|stay|resume|rephrase|on|off] [--pane %N]
+
+  status    Per-session smart-check state (default)
+  back      Restore the primary model + effort NOW (skips the quiet period)
+  stay      Pin this session to the fallback model (no auto-restore)
+  resume    Re-enable automation (clears pin / halt / primary-unavailable)
+  rephrase  Only while HALTED: ask the model to rewrite the flagged request and continue
+  on | off  Enable / disable smart-check for this session
+
+Run inside the tmux pane of the session you want to control, or pass --pane %N.`;
+
+async function cmdSmartCheck(args) {
+  const sub = args[0] || 'status';
+
+  if (sub === 'status') {
+    const states = await listSmartStates();
+    if (states.length === 0) {
+      console.log('No smart-check session state recorded yet.');
+      console.log('(State appears once a downgrade banner is handled, a command is applied, or a switch completes.)');
+      return;
+    }
+    for (const s of states) {
+      let phase = '';
+      try {
+        const snap = JSON.parse(await readFile(join(STATUS_DIR, `${s.key}.json`), 'utf-8'));
+        if (snap.smartPhase) phase = ` phase=${snap.smartPhase}`;
+      } catch { /* no live snapshot */ }
+      const flags = [
+        s.halted ? 'HALTED' : null,
+        s.pinned ? 'pinned' : null,
+        s.primaryUnavailable ? 'primary-unavailable' : null,
+        s.enabled === false ? 'off' : null,
+        s.pendingFallback ? 'pending-fallback' : null,
+      ].filter(Boolean).join(', ');
+      const flagAge = s.lastFlagAt ? `${Math.round((Date.now() - s.lastFlagAt) / 60000)}m ago` : 'never';
+      console.log(`${s.key}: model=${s.currentModel} cleanTurns=${s.cleanTurns} lastFlag=${flagAge}${phase}${flags ? ` [${flags}]` : ''}`);
+    }
+    return;
+  }
+
+  if (!SMARTCHECK_COMMANDS.has(sub)) {
+    console.log(SMARTCHECK_HELP);
+    process.exit(sub === 'help' || sub === '--help' ? 0 : 1);
+  }
+
+  const paneIdx = args.indexOf('--pane');
+  const paneArg = paneIdx !== -1 ? args[paneIdx + 1] : null;
+
+  if (process.env.TMUX && (paneArg || process.env.TMUX_PANE)) {
+    // Inside tmux: the env carries the socket, so the marker key matches the monitor's.
+    const pane = paneArg || process.env.TMUX_PANE;
+    await writeSmartCommand(pane, sub);
+    console.log(`smart-check ${sub}: queued for pane ${pane} (applies within ~5s).`);
+    return;
+  }
+
+  // Outside tmux: target by existing state-file key.
+  const states = await listSmartStates();
+  const matches = paneArg
+    ? states.filter((s) => s.key.endsWith(`_${sanitizeKey(paneArg)}`))
+    : states;
+  if (matches.length === 1) {
+    await writeSmartCommandForKey(matches[0].key, sub);
+    console.log(`smart-check ${sub}: queued for ${matches[0].key} (applies within ~5s).`);
+    return;
+  }
+  if (matches.length === 0) {
+    console.error('No matching smart-check session found. Run this inside the target tmux pane (or pass --pane %N from within tmux).');
+  } else {
+    console.error('Multiple sessions match — run inside the target tmux pane or pass --pane %N:');
+    for (const s of matches) console.error(`  ${s.key} (model=${s.currentModel})`);
+  }
+  process.exit(1);
+}
+
 async function cmdVersion() {
   try {
     const pkg = JSON.parse(await readFile(join(__dirname, '..', 'package.json'), 'utf-8'));
@@ -475,6 +559,7 @@ switch (command) {
   case 'install-timer': await cmdInstallTimer(); break;
   case 'uninstall-timer': await cmdUninstallTimer(); break;
   case 'status': await cmdStatus(); break;
+  case 'smart-check': await cmdSmartCheck(process.argv.slice(3)); break;
   case 'logs': await cmdLogs(); break;
   case 'version': case '--version': case '-v': await cmdVersion(); break;
   default:
@@ -496,6 +581,9 @@ switch (command) {
     console.log('                                       on Linux, launchd LaunchAgent on macOS)');
     console.log('  claude-auto-retry uninstall-timer    Remove the reconcile timer');
     console.log('  claude-auto-retry status             Show monitor status');
+    console.log('  claude-auto-retry smart-check [sub]  Safeguard-downgrade recovery control');
+    console.log('                                       (status|back|stay|resume|rephrase|on|off;');
+    console.log('                                       also available as: claude smart-check …)');
     console.log('  claude-auto-retry logs               Tail today\'s log');
     console.log('  claude-auto-retry version            Print version');
     break;

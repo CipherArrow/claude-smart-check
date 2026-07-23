@@ -57,7 +57,27 @@ if [ -n "$gaveUp" ]; then
   exit 0
 fi
 
+# Smart-check overlays. HALT is the loudest state (a flag switched the session below the
+# fallback model and ALL automation is stopped awaiting a human decision) — it overrides
+# everything. Otherwise a fallback-model session gets a suffix on the normal segment.
+smartHalted=$(printf '%s' "$json" | grep -o '"smartHalted":true')
+if [ -n "$smartHalted" ]; then
+  printf '🔴AR HALT'
+  exit 0
+fi
+smartModel=$(printf '%s' "$json" | grep -o '"smartModel":"[^"]*"' | head -1 | cut -d'"' -f4)
+smartPinned=$(printf '%s' "$json" | grep -o '"smartPinned":true')
+smartSuffix=''
+if [ "$smartModel" = "fallback" ] || [ "$smartModel" = "below" ]; then
+  smartSuffix='·O'
+  [ -n "$smartPinned" ] && smartSuffix='·O📌'
+fi
+
 case "$status" in
+  smartcheck)
+    # A model/effort switch sequence is in flight (fallback promote or switch-back).
+    printf '🔵AR⇄%s' "$smartSuffix"
+    ;;
   waiting)
     waitUntil=$(printf '%s' "$json" | grep -o '"waitUntil":[0-9]*' | head -1 | grep -o '[0-9]*')
     remain=$(( waitUntil - now ))
@@ -81,7 +101,7 @@ case "$status" in
     printf '🛡AR %ds' "$remain"
     ;;
   monitoring)
-    printf '🟢AR'
+    printf '🟢AR%s' "$smartSuffix"
     ;;
   *)
     exit 0

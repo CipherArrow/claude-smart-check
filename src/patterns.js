@@ -292,6 +292,12 @@ function toRegexes(patterns) {
   return out;
 }
 
+// The chrome-aware live tail as one string — for callers (smart-check) that need to test
+// config regexes against the same live region the detectors use.
+export function liveTailText(text) {
+  return tail(text).join('\n');
+}
+
 // A REAL overload always renders as an `API Error:` line ("API Error: 529 …", "API Error:
 // Server is temporarily limiting requests …", or "API Error: …" one line above a JSON
 // `overloaded_error` body). Requiring that line nearby — the same discipline safeguardMatch
@@ -356,6 +362,107 @@ export function safeguardMatch(text, patterns = []) {
 
 export function detectSafeguard(text, patterns = []) {
   return safeguardMatch(text, patterns) !== null;
+}
+
+// --- Smart-check: silent model-downgrade banner ---
+// With switchModelsOnFlag enabled, a safeguard flag renders a ● chat banner (NOT an
+// "API Error:" line) and Claude Code keeps going on the substitute model:
+//   ● Fable 5's safeguards flagged this message. … Switched to Opus 4.8. Send feedback
+//     with /feedback or learn more
+// Distinct from the API-Error safeguard render above (no switch happened there), so this
+// detector anchors on the "Switched to <model>" line instead — and CAPTURES the model
+// name, because what was switched TO decides everything: the configured fallback model
+// gets the promote-effort treatment, anything else halts automation for a human decision.
+// The anchors are config-supplied regexes whose FIRST capture group is the model name.
+const DOWNGRADE_MODEL_STOPWORDS = /\s+(?:Send feedback|Learn more|with \/feedback).*$/i;
+
+export function downgradeMatch(text, patterns = [], anchors = []) {
+  if (!patterns || patterns.length === 0 || !anchors || anchors.length === 0) return null;
+  const lines = tail(text);
+  if (!lines.join('').trim()) return null;
+  const regexes = toRegexes(patterns);
+  const anchorRegexes = toRegexes(anchors);
+  for (let i = 0; i < lines.length; i++) {
+    if (!regexes.some((r) => r.test(lines[i]))) continue;
+    // Anchor within the same wrap-tolerant window the other detectors use; the anchor
+    // line also yields the switched-to model name (capture group 1, wrap-trimmed).
+    const start = Math.max(0, i - WINDOW);
+    const end = Math.min(lines.length, i + WINDOW + 1);
+    for (let j = start; j < end; j++) {
+      for (const a of anchorRegexes) {
+        const m = a.exec(lines[j]);
+        if (!m) continue;
+        const switchedTo = (m[1] || '').replace(DOWNGRADE_MODEL_STOPWORDS, '').replace(/[.,;:]\s*$/, '').trim();
+        return {
+          pattern: a.source,
+          line: lines[i].trim().slice(0, 200),
+          switchedTo,
+          // Dedupe key: the banner is a persistent transcript line, so the SAME render
+          // must not re-trigger after it was handled. Content + switched-to model — a
+          // fresh flag prints a fresh banner line but may be textually identical, so the
+          // consumer additionally clears the remembered fingerprint once the banner
+          // leaves the live tail (mirrors _eventHandledBanner).
+          fingerprint: `${lines[i].trim().slice(0, 200)}|${switchedTo}`,
+        };
+      }
+    }
+  }
+  return null;
+}
+
+// Occurrence COUNT of a confirmation render (e.g. "Set model to Opus 4.8") in the whole
+// capture. The smart-check phases record the count before sending a command and require
+// it to INCREASE — a stale confirmation lingering in the 120-line capture from an earlier
+// switch can then never false-verify a send that actually failed.
+export function confirmationCount(text, pattern) {
+  if (!pattern) return 0;
+  let re;
+  try { re = new RegExp(pattern, 'gi'); } catch { return 0; }
+  const m = stripAnsi(text).match(re);
+  return m ? m.length : 0;
+}
+
+// Is the live input row empty? Gates smart-check injections that must not clobber text
+// the user is composing (the switch-back commands, the resume nudge). Scans bottom-up for
+// the first input-row render; an input row we can't find or read counts as NOT empty —
+// when in doubt, don't type.
+const INPUT_ROW_BOXED = /^\s*│\s*[>❯]\s*(.*?)\s*│\s*$/;   // "│ > text │"
+const INPUT_ROW_BARE = /^\s*[>❯]\s*(\S.*)?$/;              // "> text" / bare "❯"
+export function isInputEmpty(text, scanLines = 15) {
+  const lines = stripAnsi(text).split('\n');
+  for (let i = lines.length - 1; i >= Math.max(0, lines.length - scanLines); i--) {
+    let m = INPUT_ROW_BOXED.exec(lines[i]);
+    if (m) return !m[1];
+    m = INPUT_ROW_BARE.exec(lines[i]);
+    if (m) return !m[1];
+  }
+  return false;
+}
+
+// A selector UI (the /model picker, an /effort menu) is open at the prompt: the cursor
+// sits on a NUMBERED option row ("❯ 1. …"), the same render shape the rate-limit menu
+// uses (MENU_OPTION_REGEX). A bare "❯ " input prompt has no numbering, so it can never
+// look like a picker. Only consulted right after smart-check sent a slash command whose
+// confirmation never appeared — never as a standalone trigger.
+const PICKER_CURSOR_ROW = /^\s*❯\s*\d+\.\s/;
+export function isPickerOpen(text) {
+  return tail(text).some((l) => PICKER_CURSOR_ROW.test(l));
+}
+
+// Generalized cursor-steps computation: like menuStepsToWaitOption but for an arbitrary
+// target option regex, over the same numbered-option rows. Positive => press Down N
+// times, negative => Up, 0 => already there, null => layout unreadable (caller MUST NOT
+// press Enter — could confirm the wrong option).
+export function menuStepsToOption(text, optionPattern) {
+  let target;
+  try { target = optionPattern instanceof RegExp ? optionPattern : new RegExp(optionPattern, 'i'); } catch { return null; }
+  const lines = tail(text);
+  const optionLines = lines.filter((l) => MENU_OPTION_REGEX.test(l));
+  if (optionLines.length === 0) return null;
+  const cursorPos = optionLines.findIndex((l) => l.includes(MENU_CURSOR));
+  const targetPos = optionLines.findIndex((l) => target.test(l));
+  if (cursorPos === -1 || targetPos === -1) return null;
+  return targetPos - cursorPos;
 }
 
 // Chrome-aware, so isWorking measures the SAME bottom as isRateLimited/detectOverload. A

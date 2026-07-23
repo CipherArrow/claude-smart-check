@@ -1,7 +1,7 @@
 {
   "name": "claude-auto-retry",
-  "version": "0.6.0",
-  "description": "Automatically retry Claude Code sessions on subscription rate limits and sustained API overload (529/500/503) with exponential backoff",
+  "version": "0.7.0",
+  "description": "Automatically retry Claude Code sessions on subscription rate limits and sustained API overload (529/500/503) with exponential backoff. Local fork with smart-check (safeguard-downgrade model/effort recovery).",
   "type": "module",
   "bin": {
     "claude-auto-retry": "./bin/cli.js",
@@ -24,7 +24,7 @@
   ],
   "repository": {
     "type": "git",
-    "url": "https://github.com/cheapestinference/claude-auto-retry"
+    "url": "https://github.com/CipherArrow/claude-smart-check"
   },
   "files": [
     "bin/",

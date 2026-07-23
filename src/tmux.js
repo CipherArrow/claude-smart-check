@@ -72,6 +72,16 @@ export async function sendKeys(pane, text) {
   await execFileAsync('tmux', buildSendEnterArgs(pane));
 }
 
+// Slash-command variant of sendKeys: same literal-text + Enter split, but with a longer,
+// configurable settle. Typing "/model …" pops Claude Code's command palette, and the
+// palette needs more time than a plain message before the Enter reliably executes the
+// typed command (instead of racing the popup's own render).
+export async function sendCommand(pane, text, settleMs = 300) {
+  await execFileAsync('tmux', buildSendTextArgs(pane, text));
+  await new Promise(r => setTimeout(r, Math.max(settleMs, SUBMIT_DELAY_MS)));
+  await execFileAsync('tmux', buildSendEnterArgs(pane));
+}
+
 export async function getPaneCommand(pane) {
   const { stdout } = await execFileAsync('tmux', buildDisplayArgs(pane, '#{pane_current_command}'));
   return stdout.trim();

@@ -218,6 +218,14 @@ const isDirectRun = process.argv[1]?.endsWith('launcher.js');
 if (isDirectRun) {
   const args = process.argv.slice(2);
 
+  // `claude smart-check …` is a control command for the monitor, not a claude launch —
+  // route it to the CLI so the shell wrapper needs no changes.
+  if (args[0] === 'smart-check') {
+    const { spawnSync } = await import('node:child_process');
+    const r = spawnSync(process.execPath, [join(__dirname, '..', 'bin', 'cli.js'), 'smart-check', ...args.slice(1)], { stdio: 'inherit' });
+    process.exit(r.status ?? 1);
+  }
+
   let exitCode;
   if (isPrintMode(args)) {
     exitCode = await launchPrintMode(args);
