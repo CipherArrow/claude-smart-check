@@ -1,6 +1,8 @@
 MIT License
 
-Copyright (c) 2026 CheapestInference
+Copyright (c) 2026 CheapestInference (claude-auto-retry, the original work:
+https://github.com/cheapestinference/claude-auto-retry)
+Copyright (c) 2026 CipherArrow (the smart-check modifications in this fork)
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal

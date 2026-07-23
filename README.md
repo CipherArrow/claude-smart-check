@@ -25,6 +25,20 @@ claude-auto-retry install && claude-auto-retry install-hook && claude-auto-retry
 # then set "switchModelsOnFlag": true in ~/.claude/settings.json (see SMART-CHECK.md)
 ```
 
+## Attribution & license
+
+This is a **derivative work**, not an original project. The base tool — the `claude()`
+wrapper, the per-pane monitor, rate-limit auto-resume, overload backoff, the StopFailure
+hook, reconcile, and the tmux status segment — is
+**[claude-auto-retry](https://github.com/cheapestinference/claude-auto-retry) by
+CheapestInference**, used under the MIT license with its copyright notice retained (see
+[LICENSE](LICENSE)); their full commit history is preserved in this repository. What this
+fork adds on top is the **smart-check layer**: the downgrade detector and `smartcheck`
+state machine in `monitor.js`/`patterns.js`, `smartcheck-state.js`, the `smart-check` CLI,
+the config block, and the docs (`SMART-CHECK.md`, `AGENTS.md`, `COMPATIBILITY.md`). If
+smart-check is useful to you, the upstream project deserves the first star. Both the
+original and the modifications are MIT — do the same with this repo as its LICENSE allows.
+
 Everything below this line is the base tool's documentation (all of it still applies).
 
 ---
